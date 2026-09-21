@@ -414,3 +414,67 @@ def test_main_local_targets_project_folder(tmp_path, monkeypatch, mocks):
     mocks["install_global_command"].assert_called_once_with(
         "thero", tmp_path / "thero.py", local=True
     )
+
+
+# ---------------------------------------------------------------------------
+# --mcp / --publish
+# ---------------------------------------------------------------------------
+
+
+def test_parse_args_mcp_and_publish_defaults(monkeypatch):
+    set_argv(monkeypatch)
+
+    args = parse_args()
+
+    assert args.mcp is False
+    assert args.publish is False
+    assert args.publish_agent == "all"
+    assert args.publish_out is None
+
+
+def test_parse_args_publish_agent(monkeypatch):
+    set_argv(monkeypatch, "--publish", "--publish-agent", "claude,qoder")
+
+    args = parse_args()
+
+    assert args.publish is True
+    assert args.publish_agent == "claude,qoder"
+
+
+def test_main_mcp_starts_server_and_returns(tmp_path, monkeypatch):
+    set_argv(monkeypatch, "--mcp")
+
+    with patch("thero.mcp.server.serve") as mock_serve, patch(
+        f"{MODULE}.install_all_skills"
+    ) as mock_install:
+        main(tmp_path / "thero.py")
+
+    mock_serve.assert_called_once_with(tmp_path / "thero.py")
+    # MCP não pode disparar nenhum passo do fluxo de instalação.
+    mock_install.assert_not_called()
+
+
+def test_main_publish_writes_for_resolved_agents(tmp_path, monkeypatch):
+    set_argv(monkeypatch, "--publish", "--publish-agent", "claude")
+
+    out = tmp_path / "pub"
+    set_argv(monkeypatch, "--publish", "--publish-agent", "claude", "--publish-out", str(out))
+
+    with patch("thero.publish.installer.publish") as mock_publish, patch(
+        "thero.publish.installer.serve_command", return_value="python thero.py --mcp"
+    ):
+        main(tmp_path / "thero.py")
+
+    kwargs = mock_publish.call_args.kwargs
+    assert kwargs["agents"] == ["claude"]
+    assert kwargs["out_dir"] == out
+    assert mock_publish.call_args.args[0] == tmp_path / "thero.py"
+
+
+def test_main_publish_rejects_unknown_agent_exits(tmp_path, monkeypatch):
+    set_argv(monkeypatch, "--publish", "--publish-agent", "bogus")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(tmp_path / "thero.py")
+
+    assert exc_info.value.code == 1

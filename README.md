@@ -107,8 +107,17 @@ python thero.py [opções]
 | `--plan TAREFA`              | Roda o [Zeus](https://github.com/theroverse/zeus) na pasta atual para planejar `TAREFA` (escreve `.claude/zeus-plan.md`); instala/atualiza automaticamente via git, mesmo mecanismo do `--index`. |
 | `--check`                    | Verifica se alguma skill instalada tem atualização disponível (`npx skills check` + `npx impeccable check`). |
 | `--update`                   | Atualiza as skills instaladas para a versão mais recente (`npx skills update` + `npx impeccable update`). |
+| `--mcp`                      | Sobe o servidor [MCP](https://modelcontextprotocol.io) do Theroverse em stdio (JSON-RPC), expondo Athena/Zeus/Thero como ferramentas chamáveis direto de um agente (Claude Code, OpenCode, Qoder). Bloqueia lendo stdin; não instala nada. |
 | `--local`                    | Faz tudo (`CLAUDE.md`, skills, comando) mirar a pasta do projeto atual em vez do usuário global. Combina com qualquer outra flag. |
 | `-h`, `--help`               | Mostra a ajuda e sai, sem instalar nada, sem modificar arquivos e sem chamar o Claude. |
+
+Flags de publicação (com `--publish`):
+
+| Flag                       | O que faz                                                         |
+|-----------------------------|---------------------------------------------------------------------|
+| `--publish`                 | Gera as skills/comandos first-party (Athena/Zeus/Thero — mesmo registro do `--mcp`) nos diretórios nativos de cada agente, para uso sem MCP. Também imprime a linha de registro do servidor MCP. |
+| `--publish-agent AGENTES`   | Com `--publish`: quais agentes escrever (`claude`, `qoder`, `opencode`, `all` ou CSV). Padrão: `all`. |
+| `--publish-out DIR`         | Com `--publish`: escreve sob `DIR` em vez do diretório nativo de cada agente (empacotar/testar). |
 
 ## Exemplos
 
@@ -186,6 +195,20 @@ Ver a ajuda (não instala nada, não modifica nada, não chama o Claude):
 ```
 python thero.py --help
 python thero.py -h
+```
+
+Subir o servidor MCP do Theroverse (para registrar em um agente):
+
+```
+python thero.py --mcp
+```
+
+Publicar as skills/comandos first-party nos agentes e ver a linha de registro do MCP:
+
+```
+python thero.py --publish
+python thero.py --publish --publish-agent claude,opencode
+python thero.py --publish --publish-out ./.agents/skills
 ```
 
 ## Fluxo recomendado
@@ -286,6 +309,46 @@ sozinho antes de planejar (o Zeus faz isso), então não precisa rodar
 o `.claude/zeus-plan.md` resultante como ponto de partida de contexto
 (formato: seções fixas Objetivo / Arquivos selecionados / Passo a
 passo / Riscos) — não é obrigatório rodar o Zeus para usar o `thero`.
+
+## Theroverse MCP (`--mcp` / `--publish`)
+
+Além de configurar o Claude Code, o `thero` expõe Athena, Zeus e ele
+mesmo como **ferramentas que uma IA chama diretamente** — inclusive
+desta que você está usando agora. Um único **registro de capacidades**
+(`src/thero/mcp/capabilities.py`) é a fonte de verdade e alimenta duas
+superfícies complementares:
+
+**1. Servidor MCP (`--mcp`)** — JSON-RPC 2.0 em stdio que expõe as
+ferramentas `athena_index`, `athena_recall`, `athena_remember`,
+`zeus_plan` e `thero_audit`. Um só servidor cobre todo agente que fala
+[MCP](https://modelcontextprotocol.io) — Claude Code, OpenCode e
+Qoder. Registre-o no agente com um comando que rode
+`python <caminho>/thero.py --mcp`:
+
+- **Claude Code** — em `~/.claude.json` (ou `settings`), sob
+  `"mcpServers"`.
+- **OpenCode** — no bloco `"mcp"` do `opencode.json`.
+- **Qoder** — na configuração de servidores MCP.
+
+O servidor escreve **só JSON-RPC no stdout** (diagnóstico vai para
+stderr), então pode ser plugado direto sem banner poluindo o canal.
+
+**2. Skills/comandos first-party (`--publish`)** — para uso onde MCP
+não está ativo, gera arquivos markdown nativos com o caminho do CLI já
+resolvido em tempo de publicação: `SKILL.md` para Claude Code e Qoder,
+comando `.md` para OpenCode. Rodar `--publish` também imprime a linha
+exata de `--mcp` pronta para registrar o servidor. Bases por agente:
+
+| Agente     | Diretório-alvo (glob)                       | Com `--local` / override |
+|------------|---------------------------------------------|---------------------------|
+| `claude`   | `~/.claude/skills`                          | `./.claude/skills`        |
+| `qoder`    | env `THERO_QODER_SKILLS_DIR` → `~/.qoder/skills` | —                   |
+| `opencode` | env `THERO_OPENCODE_CMD_DIR` → `~/.config/opencode/command` | `--publish-out DIR` |
+
+Ferramenta cujo script não seja resolvido (ex.: Zeus ainda não
+instalado) é **pulada com aviso** — o publicador nunca inventa
+caminho. `--publish-out DIR` escreve num diretório explícito
+(empacotar/testar), ignorando as bases acima.
 
 ## Skills
 
@@ -432,7 +495,9 @@ thero/
 │   ├── claude_md/               # cliente `claude -p` + merge do CLAUDE.md
 │   ├── audit/                    # auditoria de projeto (read-only)
 │   ├── shell_command/             # comando de atalho (PowerShell + bash/zsh, global/local)
-│   ├── integrations/               # ponte com ferramentas externas (Athena)
+│   ├── integrations/               # ponte com ferramentas externas (Athena, Zeus)
+│   ├── mcp/                         # registro de capacidades + servidor MCP (stdio JSON-RPC)
+│   ├── publish/                      # publicador de skills/comandos por agente (claude/qoder/opencode)
 │   └── system/                      # processo, backup, ambiente
 ├── README.md
 └── .gitignore

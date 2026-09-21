@@ -56,6 +56,22 @@ COMANDOS
                        "npx skills" e "impeccable") para a versao
                        mais recente. Nao mexe no CLAUDE.md nem no
                        comando.
+    --mcp              Serve o servidor MCP (Model Context Protocol)
+                       do Theroverse em stdio (JSON-RPC), expondo
+                       Athena/Zeus/Thero como ferramentas chamáveis
+                       por qualquer agente MCP (Claude Code, OpenCode,
+                       Qoder). Bloqueia lendo stdin; nao instala nada.
+                       Ver secao THEROVERSE MCP.
+    --publish          Escreve as skills/comandos first-party (mesmo
+                       registro do --mcp) nos diretorios nativos de
+                       cada agente, para uso sem MCP. Ver secao
+                       THEROVERSE MCP.
+    --publish-agent A  Com --publish: quais agentes escrever
+                       ("claude", "qoder", "opencode", "all" ou CSV
+                       separado por virgula). Padrao: "all".
+    --publish-out DIR  Com --publish: escreve sob DIR em vez do
+                       diretorio nativo de cada agente (util para
+                       testar ou empacotar).
     --local            Opera na pasta do projeto atual em vez do
                        usuario global: CLAUDE.md vira ./CLAUDE.md
                        (nao ~/.claude/CLAUDE.md), skills instalam
@@ -83,6 +99,10 @@ EXEMPLOS
     python thero.py --plan "criar a nave Vector" --plan-context C:\Users\x\monorepo
     python thero.py --check
     python thero.py --update
+    python thero.py --mcp
+    python thero.py --publish
+    python thero.py --publish --publish-agent claude,opencode
+    python thero.py --publish --publish-out ./.agents/skills
     python thero.py --help
 
 FLUXO RECOMENDADO
@@ -169,6 +189,35 @@ ZEUS (--plan TAREFA)
     projetos irmaos (estrutura de pastas, arquivo de dependencias,
     padrao de CLI, testes) em vez do Claude decidir tudo do zero sem
     ver esse contexto: aponte --plan-context pra raiz do monorepo.
+
+THEROVERSE MCP (--mcp / --publish)
+    O mesmo registro de capacidades (fonte unica de verdade) alimenta
+    duas superfícies para você chamar Athena/Zeus/Thero diretamente de
+    dentro de uma IA (inclusive desta):
+
+    1. Servidor MCP (--mcp): JSON-RPC em stdio que expoe as ferramentas
+       (athena_index, athena_recall, athena_remember, zeus_plan,
+       thero_audit). Um unico servidor cobre todos os agentes que falam
+       MCP (Claude Code, OpenCode, Qoder). Registre-o no agente apontando
+       um comando que rode:
+           python <caminho>/thero.py --mcp
+       No Claude Code isso vai em ~/.claude.json (ou settings) sob
+       "mcpServers"; no OpenCode, no bloco "mcp" do opencode.json; no
+       Qoder, na configuracao de servidores MCP. O servidor nao imprime
+       banner no stdout (so JSON-RPC); diagnostico vai para stderr.
+
+    2. Skills/comandos (--publish): escreve arquivos markdown nativos
+       (SKILL.md para Claude/Qoder, comando .md para OpenCode) com o
+       caminho do CLI ja resolvido, para uso onde MCP nao esta ativo.
+       Rodar "--publish" mostra na saida a linha exata de "--mcp" para
+       voce registrar o servidor tambem. BASES por agente:
+       claude -> ~/.claude/skills (ou ./.claude/skills com --local);
+       qoder -> env THERO_QODER_SKILLS_DIR (senao ~/.qoder/skills);
+       opencode -> env THERO_OPENCODE_CMD_DIR (senao
+       ~/.config/opencode/command). Use --publish-out para escrever num
+       diretorio explicito (empacotar/testar). Ferramenta cujo script nao
+       seja resolvido (ex.: Zeus ainda nao instalado) e pulada com aviso,
+       nunca inventa caminho.
 
 SKILLS
     Skills sao instaladas individualmente a partir de repositorios
@@ -383,12 +432,66 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--mcp",
+        action="store_true",
+        help=(
+            "Start the Theroverse MCP server on stdio (JSON-RPC), "
+            "exposing Athena (index/recall/remember), Zeus (plan) and "
+            "Thero (audit) as tools to any MCP-capable agent (Claude "
+            "Code, OpenCode, Qoder). Register once per agent with the "
+            "command shown by --publish. Blocks reading stdin; does "
+            "not install skills or touch CLAUDE.md."
+        ),
+    )
+
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help=(
+            "Generate first-party skill/command files (Athena/Zeus/"
+            "Thero) for the chosen agents, from the same capability "
+            "registry the MCP server uses. Complements --mcp with "
+            "human-discoverable slash-commands. Prints the MCP "
+            "registration line too."
+        ),
+    )
+
+    parser.add_argument(
+        "--publish-agent",
+        metavar="AGENTS",
+        default="all",
+        help=(
+            "With --publish: which agents to write for 'claude', "
+            "'opencode', 'qoder', a comma list, or 'all' (default)."
+        ),
+    )
+
+    parser.add_argument(
+        "--publish-out",
+        metavar="DIR",
+        default=None,
+        help=(
+            "With --publish: write under DIR instead of each agent's "
+            "native skills/command directory."
+        ),
+    )
+
     return parser.parse_args()
 
 
 def main(entry_path: Path) -> None:
 
     args = parse_args()
+
+    # O servidor MCP fala JSON-RPC por stdout: nada mais pode ser
+    # impresso no canal antes dele (nem o banner abaixo). Por isso a
+    # flag --mcp é tratada na primeira linha do main.
+    if args.mcp:
+        from thero.mcp.server import serve
+
+        serve(entry_path)
+        return
 
     print("=" * 70)
     print(" Claude Code Engineering Stack Installer")
@@ -400,6 +503,38 @@ def main(entry_path: Path) -> None:
             "[INFO] --local: operating on the current project "
             f"folder ({Path.cwd()}), not the global user config."
         )
+
+    # --------------------------------------------------------
+    # Publicador de skills (não exige setup Claude; prints ok,
+    # não é um canal de protocolo)
+    # --------------------------------------------------------
+
+    if args.publish:
+        from thero.publish.installer import (
+            publish,
+            resolve_agents,
+            serve_command,
+        )
+
+        try:
+            agents = resolve_agents(args.publish_agent)
+        except ValueError as exc:
+            print(f"[ERROR] {exc}")
+            sys.exit(1)
+
+        out_dir = Path(args.publish_out).expanduser() if args.publish_out else None
+
+        publish(
+            entry_path,
+            agents=agents,
+            local=args.local,
+            out_dir=out_dir,
+        )
+
+        print()
+        print("[INFO] Registro MCP (comando para colar no agente):")
+        print(f"       {serve_command(entry_path)}")
+        return
 
     # --------------------------------------------------------
     # Targets: global (~/.claude) vs local (project folder)
