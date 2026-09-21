@@ -212,6 +212,32 @@ findings that are supported by the current code. Do not perform
 unrelated refactors. Verify every correction.
 ```
 
+## Como plugin (Claude Code e Codex)
+
+O repositório também é um plugin. Ele expõe 4 skills que chamam o
+`thero.py` a partir da pasta do projeto atual: `thero`
+(`skills|merge|check|update`), `thero-audit`, `thero-index` e
+`thero-plan`. Todas só rodam quando você as invoca.
+
+**Claude Code** (`/thero:thero`, `/thero:thero-audit`, ...):
+
+```
+claude plugin marketplace add theroverse/thero
+claude plugin install thero@thero
+```
+
+**Codex** (skills `thero`, `thero-audit`, ...):
+
+```
+codex plugin marketplace add theroverse/thero
+codex plugin add thero@thero
+```
+
+Para testar uma cópia local, troque `theroverse/thero` pelo caminho da
+pasta. Reinicie a sessão (ou recarregue a janela do VSCode) depois de
+instalar. O plugin não instala o comando `thero` no shell nem as skills
+externas: rode `thero` uma vez no seu terminal para isso.
+
 ## Comando de atalho (PowerShell)
 
 O `thero` instala um comando de atalho (`thero` por padrão) que roda o

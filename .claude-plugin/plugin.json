@@ -1,0 +1,13 @@
+{
+  "name": "thero",
+  "version": "1.1.0",
+  "description": "Configura o Claude Code/Codex para engenharia de software: instala Agent Skills, consolida o CLAUDE.md, audita o projeto e integra Athena/Zeus.",
+  "author": {
+    "name": "Theroverse",
+    "url": "https://github.com/theroverse"
+  },
+  "homepage": "https://github.com/theroverse/thero",
+  "repository": "https://github.com/theroverse/thero",
+  "license": "MIT",
+  "keywords": ["skills", "claude-md", "audit", "athena", "zeus"]
+}

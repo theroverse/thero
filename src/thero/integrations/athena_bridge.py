@@ -72,7 +72,7 @@ def run_athena_index(entry_path: Path, max_files: int | None = None) -> bool:
     sys.stdout.flush()
 
     cmd = [
-        "python",
+        sys.executable,
         str(athena_script),
         "index",
         project_dir,

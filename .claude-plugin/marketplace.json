@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "thero",
+  "description": "Thero: configuração de engenharia para Claude Code e Codex.",
+  "owner": {
+    "name": "Theroverse",
+    "url": "https://github.com/theroverse"
+  },
+  "plugins": [
+    {
+      "name": "thero",
+      "description": "Instala Agent Skills, consolida o CLAUDE.md, audita o projeto e integra Athena/Zeus.",
+      "source": "./",
+      "category": "development"
+    }
+  ]
+}

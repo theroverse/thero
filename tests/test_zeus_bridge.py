@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from unittest.mock import MagicMock, patch
 
 from thero.integrations.zeus_bridge import (
@@ -81,7 +82,7 @@ def test_run_zeus_plan_builds_correct_command(tmp_path):
 
     assert result is True
     called_command = mock_run.call_args.args[0]
-    assert called_command[0] == "python"
+    assert called_command[0] == sys.executable
     assert called_command[1] == str(zeus_script)
     assert called_command[2] == "plan"
     assert called_command[3] == "do the thing"

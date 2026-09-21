@@ -76,7 +76,7 @@ def run_zeus_plan(
     project_dir = str(Path.cwd())
 
     command = [
-        "python",
+        sys.executable,
         str(zeus_script),
         "plan",
         task,
