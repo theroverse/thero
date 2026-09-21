@@ -190,6 +190,29 @@ def handle_request(
     return error(-32601, f"Método não suportado: {method!r}")
 
 
+def _force_utf8(*streams: Any) -> None:
+    """
+    Garante que o canal JSON-RPC fale UTF-8, qualquer que seja a
+    codepage local do processo.
+
+    Escrevemos as respostas com ``ensure_ascii=False`` (título e
+    descrições levam acentos/ travessões). Sem isto, num Windows em
+    cp1252/cp850 o ``print`` codificaria esses caracteres em bytes que
+    um cliente MCP (que decodifica UTF-8, como manda a spec) leria
+    corrompidos. ``reconfigure`` existe no ``TextIOWrapper`` (3.7+); se
+    o stream já estiver redirecionado (ex.: StringIO em testes), ignoramos.
+    """
+
+    for stream in streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass
+
+
 def _write(message: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(message, ensure_ascii=False) + "\n")
     sys.stdout.flush()
@@ -208,6 +231,10 @@ def serve(
     """
 
     project_dir = project_dir or Path.cwd()
+
+    # UTF-8 no canal JSON-RPC (stdout/stdin) e no log (stderr), para que
+    # os acentos das descrições sobrevivam ao pipe em qualquer codepage.
+    _force_utf8(sys.stdout, sys.stdin, sys.stderr)
 
     sys.stderr.write(
         f"[theroverse mcp] pronto em {project_dir} "

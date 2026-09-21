@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import io
+import json
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -7,6 +11,8 @@ from thero.mcp import server
 
 ENTRY = Path("/repo/thero/thero.py")
 PROJ = Path("/work/proj")
+# thero.py real (raiz do repo), para o teste de subprocess ponta-a-ponta.
+THERO_ENTRY = Path(__file__).resolve().parents[1] / "thero.py"
 
 
 def _fake_result(returncode=0, stdout="", stderr=""):
@@ -200,3 +206,48 @@ def test_dispatch_runner_oserror_becomes_clean_error():
 
     assert is_error is True
     assert "python nao encontrado" in text
+
+
+# -- canal UTF-8 (regressão: codepage local não pode corromper acentos) ------
+
+
+def test_force_utf8_makes_stream_emit_utf8_regardless_of_locale():
+    # Simula um stdout em cp1252 (codepage típica de Windows) e exige que
+    # _force_utf8 o reconverta para UTF-8: o travessão (U+2014) e o 'é'
+    # devem sair como bytes UTF-8 válidos, não como 0x97/0xE9 locais.
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1252")
+
+    server._force_utf8(stream)
+    stream.write("memória — pé")
+    stream.flush()
+
+    assert raw.getvalue().decode("utf-8") == "memória — pé"
+
+
+def test_force_utf8_tolerates_streams_without_reconfigure():
+    # StringIO (usado em testes/capture) não tem reconfigure: deve ignorar
+    # em silêncio em vez de estourar.
+    server._force_utf8(io.StringIO())
+
+
+def test_mcp_stdio_emits_decodable_utf8_end_to_end():
+    # Roda o servidor real como um cliente MCP faria e exige que o stdout
+    # decodifique como UTF-8 com os acentos das descrições intactos.
+    payload = (
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, str(THERO_ENTRY), "--mcp"],
+        input=payload.encode("utf-8"),
+        capture_output=True,
+        # Sem PYTHONIOENCODING: o filho herda a codepage local (cp1252 no
+        # Windows). Só o _force_utf8 do servidor garante UTF-8 no canal —
+        # sem o fix, o travessão vira 0x97 e o decode abaixo estoura.
+    )
+
+    stdout = proc.stdout.decode("utf-8")  # UnicodeDecodeError aqui = regressão
+    msg = json.loads(stdout.strip().splitlines()[-1])
+    descs = {t["name"]: t["description"] for t in msg["result"]["tools"]}
+
+    assert "memória" in descs["athena_recall"]
