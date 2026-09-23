@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Thero</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Barra de título própria (sem chrome de navegador) -->
+    <header class="titlebar" id="titlebar">
+      <div class="titlebar-brand">
+        <span class="titlebar-mark"><img src="assets/thero-mark.png" alt="" width="16" height="16" /></span>
+        <span class="titlebar-text">THERO<span class="titlebar-text-dim">.EXE</span></span>
+        <span class="titlebar-phase" id="titlebar-phase"></span>
+      </div>
+      <div class="titlebar-tools">
+        <button class="scope-toggle" id="scope-toggle" title="Alternar escopo (--local)">
+          <span class="scope-led" aria-hidden="true"></span><span id="scope-label">Global</span>
+        </button>
+        <span class="titlebar-sep"></span>
+        <button class="win-btn" id="btn-min" title="Minimizar" aria-label="Minimizar">&#8211;</button>
+        <button class="win-btn win-btn-close" id="btn-close" title="Fechar" aria-label="Fechar">&#10005;</button>
+      </div>
+    </header>
+
+    <div class="shell">
+      <nav class="sidebar" id="sidebar" aria-label="Seções"></nav>
+      <main class="content" id="content" tabindex="-1"></main>
+    </div>
+
+    <!-- Rodapé: construtor de comando ao vivo (UI -> thero.py) -->
+    <footer class="cmdbar">
+      <div class="cmdbar-hint" id="cmdbar-hint">comando montado a partir das opções</div>
+      <div class="cmdbar-cmd"><code id="cmd-preview">python thero.py</code></div>
+      <div class="cmdbar-actions">
+        <button class="btn btn-ghost" id="btn-copy" title="Copiar comando">Copiar</button>
+        <button class="btn btn-primary" id="btn-run">Executar</button>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Onboarding de primeira abertura (sem CLI instalada) -->
+  <div class="overlay" id="onboarding" hidden></div>
+
+  <!-- Painel de execução / log do motor -->
+  <div class="overlay" id="runpanel" hidden></div>
+
+  <script src="mock.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
