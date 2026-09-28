@@ -11,7 +11,10 @@ from thero.system.backup import backup_file
 from thero.system.process import run_command
 
 
-def resolve_powershell_profile() -> Path | None:
+def resolve_powershell_profile(timeout: float | None = None) -> Path | None:
+    # `timeout` nao e opcional por capricho: a ponte chama esta sonda via
+    # envreport._profile_path num loop de stdio, e PowerShell pendurado
+    # congela a janela inteira. Quem nao passa timeout mantem o hoje (None).
 
     result = run_command(
         [
@@ -21,6 +24,7 @@ def resolve_powershell_profile() -> Path | None:
             "$PROFILE",
         ],
         capture=True,
+        timeout=timeout,
     )
 
     if result.returncode != 0:

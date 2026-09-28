@@ -14,10 +14,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 from thero import config as config_store
-from thero.settings import DEFAULT_COMMAND_NAME
+from thero.settings import COMMAND_MARKER_START, DEFAULT_COMMAND_NAME
 from thero.system.process import run_command
 
 _TOOLS = ("node", "npx", "claude", "git")
@@ -26,22 +26,32 @@ _TOOLS = ("node", "npx", "claude", "git")
 # teto congela a janela inteira.
 VERSION_TIMEOUT = 10
 
+# Idem para o spawn `powershell -Command $PROFILE` da sonda de perfil: filho
+# no mesmo loop, mesmo teto obrigatorio.
+PROFILE_TIMEOUT = 5
+
 
 def _which(name: str) -> Optional[str]:
     return shutil.which(name)
 
 
-def _first_line(command: list) -> str:
-    """Primeira linha nao vazia de `<cmd> --version` ('' se silenciar ou travar)."""
+def _version_probe(command: list) -> tuple:
+    """(primeira linha nao vazia, ok) de `<cmd> --version`.
+
+    `ok` vem do returncode real, nao do texto: ferramenta que sai com erro
+    imprimindo saida "limpa" continua nao-ok ('' e False se silenciar ou
+    travar).
+    """
     try:
         result = run_command(command + ["--version"], timeout=VERSION_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return ""
-    out = (result.stdout or "") if result.returncode == 0 else (result.stderr or "")
+        return "", False
+    ok = result.returncode == 0
+    out = (result.stdout or "") if ok else (result.stderr or result.stdout or "")
     for line in out.splitlines():
         if line.strip():
-            return line.strip()
-    return ""
+            return line.strip(), ok
+    return "", False
 
 
 def _ollama_probe() -> dict:
@@ -61,10 +71,12 @@ def _ollama_probe() -> dict:
 def _profile_path() -> Optional[Path]:
     if platform.system() != "Windows":
         return None
-    from thero.shell_command.windows import resolve_powershell_profile
-
     try:
-        return resolve_powershell_profile()
+        # Import dentro da fronteira protegida: modulo quebrado degrada so
+        # este campo, nunca o payload inteiro da tela de Status.
+        from thero.shell_command.windows import resolve_powershell_profile
+
+        return resolve_powershell_profile(timeout=PROFILE_TIMEOUT)
     except Exception:  # noqa: BLE001 - conforto, nunca motivo de falha na GUI
         return None
 
@@ -76,14 +88,22 @@ def _command_installed(profile: Optional[Path]) -> bool:
         text = Path(profile).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
-    return DEFAULT_COMMAND_NAME in text
+    # Casa o marcador exato que o instalador do comando global escreve --
+    # nunca a substring "thero": o bloco de ENV da Task 5 vive no mesmo
+    # $PROFILE e cita o nome.
+    return COMMAND_MARKER_START in text
 
 
 def _count_skills(skills_base: Path) -> int:
-    if not skills_base.is_dir():
+    # Fronteira fs: is_dir()/iterdir() podem negar (PermissionError) -- a
+    # contagem degrada a 0 e o snapshot continua de pe.
+    try:
+        if not skills_base.is_dir():
+            return 0
+        return sum(1 for folder in sorted(skills_base.iterdir())
+                   if folder.is_dir() and (folder / "SKILL.md").exists())
+    except OSError:
         return 0
-    return sum(1 for folder in sorted(skills_base.iterdir())
-               if folder.is_dir() and (folder / "SKILL.md").exists())
 
 
 def snapshot(
@@ -106,16 +126,14 @@ def snapshot(
         ok = False
         if found:
             try:
-                line = _first_line([name])
+                line, ok = _version_probe([name])
             except Exception as exc:  # noqa: BLE001 - fronteira: nunca derrubar a GUI
                 line = ""
                 detail = str(exc)
-            if line.lower().startswith("error"):
-                detail = line
-            elif line:
-                ok = True
+            if line:
                 detail = line
             else:
+                ok = False
                 detail = detail or "sem saida de --version"
         tools[name] = {"found": found, "ok": ok, "detail": detail}
 
@@ -124,9 +142,16 @@ def snapshot(
     except Exception as exc:  # noqa: BLE001
         ollama = {"up": False, "host": "", "models": [], "error": str(exc)}
 
-    exists = claude_md.exists()
-    md_bytes = claude_md.stat().st_size if exists else 0
-    backups = sorted(claude_dir.glob("CLAUDE.md.backup*")) if claude_dir.is_dir() else []
+    try:
+        exists = claude_md.exists()
+        md_bytes = claude_md.stat().st_size if exists else 0
+    except OSError:  # fronteira fs: degrada so o campo claudeMd
+        exists, md_bytes = False, 0
+    try:
+        backups = (sorted(claude_dir.glob("CLAUDE.md.backup*"))
+                   if claude_dir.is_dir() else [])
+    except OSError:  # idem: so o contador de backups degrada
+        backups = []
     profile = _profile_path()
 
     return {
