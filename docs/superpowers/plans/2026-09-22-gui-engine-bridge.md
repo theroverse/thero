@@ -22,7 +22,7 @@
 | JS↔PS exige `JSON.stringify`; o host lê com `TryGetWebMessageAsString()` | `vector/gui/vector/app.js:40-50`, memória `webview2-js-to-ps-bridge-requires-json-stringify` |
 | Contrato real de consumidor dos modelos locais: `ATHENA_OLLAMA_HOST` / `ATHENA_OLLAMA_MODEL`, default `http://localhost:11434` e `llama3.2`, backend `auto` | `athena/src/athena/settings.py:52-72` |
 | Ollama **não** está instalado aqui (11434 recusa conexão; `where ollama` vazio) | mediado em 2026-09-22 |
-| Sentinel **não** instala nem baixa motor nenhum, mas **tem** consumidor próprio: resolve `SENTINEL_OLLAMA_HOST` > `.sentinel/config.json` > padrão `http://127.0.0.1:11434`, e `SENTINEL_OLLAMA_MODEL` com padrão `qwen3-coder-next`; host fora de loopback é recusado no código | `sentinel/src/sentinel/settings.py:205-243` + `src/sentinel/local_model.py` (commit `a4b1412`, 2026-09-22) |
+| Sentinel **não** instala nem baixa motor nenhum, mas **tem** consumidor próprio: resolve `SENTINEL_OLLAMA_HOST` > `.sentinel/config.json` > padrão `http://127.0.0.1:11434`, e `SENTINEL_OLLAMA_MODEL` com padrão `qwen3-coder-next`; host fora de loopback é recusado no código | `sentinel/src/sentinel/settings.py:255-283` (`OLLAMA_HOST_ENV` :263, `OLLAMA_MODEL_ENV` :264, `DEFAULT_MODEL_BASE` :269, `DEFAULT_MODEL_NAME` :276, `MODEL_LOOPBACK_HOSTS` :283) + `src/sentinel/local_model.py:90` (commit `a4b1412`, 2026-09-22) |
 | `~/.claude/settings.json` existe e é JSON simples; o Claude Code aceita `model` no topo e um bloco `env`, e `ANTHROPIC_MODEL` é variável real | arquivo lido + docs.claude.com/settings |
 | **Não verificado** (portanto **não** será escrito): `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` | — |
 | `~/.config/opencode/opencode.json` existe (`$schema`, `instructions`); o schema oficial aceita `model` no formato `provider/model` e blocos `provider.<id>.{npm,options}` | arquivo + opencode.ai/config.json |
@@ -259,7 +259,7 @@ SKILLS_QUARANTINE_DIRNAME = "skills"
 
 # Bloco de ambiente no $PROFILE: e como ATHENA_OLLAMA_HOST/MODEL (athena/src/
 # athena/settings.py) e SENTINEL_OLLAMA_HOST/MODEL (sentinel/src/sentinel/
-# settings.py:205-243) chegam de fato a qualquer processo lancado do terminal.
+# settings.py:255-283) chegam de fato a qualquer processo lancado do terminal.
 # Marcadores proprios, diferentes dos do
 # comando global, para um upsert nao comer o outro.
 ENV_MARKER_START = "# >>> thero env >>>"
@@ -270,6 +270,11 @@ ENV_MARKER_END = "# <<< thero env <<<"
 OLLAMA_DEFAULT_HOST = "http://127.0.0.1:11434"
 
 OLLAMA_PROBE_TIMEOUT = 3
+
+# Teto de leitura POR OPERACAO do `ollama pull` (timeout de socket em cada
+# read, nao a duracao total do download): um modelo de varios GB passa pelas
+# fases `verifying sha256`/`writing blob` sem emitir bytes por minutos.
+OLLAMA_PULL_TIMEOUT = 1800
 ```
 
 - [ ] **Step 4: `presets.py` — espelho fiel do mock aprovado**
@@ -516,7 +521,7 @@ def default_agents() -> list:
 def default_routing() -> dict:
     # Cada slot comeca com o padrao que aquele proprio consumidor ja usa no
     # codigo dele: Athena = llama3.2 (athena/src/athena/settings.py), Sentinel
-    # = qwen3-coder-next (sentinel/src/sentinel/settings.py:228).
+    # = qwen3-coder-next (sentinel/src/sentinel/settings.py:276).
     return {"mode": "zeus", "athena": "llama3.2",
             "sentinel": "qwen3-coder-next", "fallback": "Claude Code"}
 ```
@@ -1138,9 +1143,27 @@ consumidores reais são dois, cada um com seu par de variáveis: a Athena via
 `ATHENA_OLLAMA_HOST` / `ATHENA_OLLAMA_MODEL`
 (`athena/src/athena/settings.py:52-72`, default `http://localhost:11434`) e o
 Sentinel via `SENTINEL_OLLAMA_HOST` / `SENTINEL_OLLAMA_MODEL`
-(`sentinel/src/sentinel/settings.py:255-279`, default `http://127.0.0.1:11434`
+(`sentinel/src/sentinel/settings.py:255-283`, default `http://127.0.0.1:11434`
 e `qwen3-coder-next`). Os dois recusam host fora de loopback, e nenhum dos dois
 instala motor: o Thero só escreve onde apontar.
+
+**Correções já aplicadas neste plano (revisão pós-implementação do commit `b73beb8`):**
+1. O `pull()` **streaming de verdade**: itera a resposta em linhas em vez de
+   `read()` do corpo inteiro, e usa `OLLAMA_PULL_TIMEOUT` (teto de *leitura por
+   operação*, não de duração total) em vez do `OLLAMA_PROBE_TIMEOUT` de 3 s.
+   Com o corpo slurpado, um `ollama pull` de vários GB abortava nas fases
+   `verifying sha256`/`writing blob` e nenhum `("out", linha)` chegava antes do
+   fim — a tela de progresso da Task 10 ficava sem o que mostrar. Os caminhos de
+   `list_models`/`delete`/`status` **continuam** com `OLLAMA_PROBE_TIMEOUT`.
+2. `list_models()` trata payload malformado na fronteira: `models` que não seja
+   lista → `{"ok": False, ..., "error": "resposta inesperada do Ollama
+   (/api/tags)"}`; item que não seja objeto → valores vazios; `size` inválido →
+   `0` (e `sizeHuman` `"-"`), **mantendo `ok: True`** — um tamanho ilegível não
+   esconde o modelo que o usuário tem instalado. Nada de
+   `AttributeError`/`ValueError` escapando pelo canal JSON da ponte.
+3. Citações do contrato Ollama do Sentinel realinhadas ao `sentinel/` de hoje
+   (`settings.py:255-283`, `DEFAULT_MODEL_NAME` em `:276`, veto em
+   `local_model.py:90`) — a Task 5 e a Task 8 consomem estes ponteiros.
 
 - [ ] **Step 1: Testes**
 
@@ -1155,14 +1178,29 @@ from thero import localmodels
 
 
 class FakeResponse:
-    """Corpo inteiro disponível via read() -- o mesmo contrato do
-    HTTPResponse real para o uso que o módulo faz (sem iterar a resposta)."""
+    """Corpo inteiro via read() E iteravel em linhas -- os dois contratos do
+    `http.client.HTTPResponse` real. `served`/`read_calls` existem para o teste
+    provar que o pull consome linha a linha em vez de slurpar o corpo."""
 
     def __init__(self, payload):
         self._payload = payload
+        parts = payload.split(b"\n")
+        # Corte so em b"\n", igual ao readline() do HTTPResponse real (que nao
+        # trata \r, \v nem \f como fim de linha).
+        self._lines = [p + b"\n" for p in parts[:-1]]
+        if parts[-1]:
+            self._lines.append(parts[-1])
+        self.served = 0
+        self.read_calls = 0
 
     def read(self):
+        self.read_calls += 1
         return self._payload
+
+    def __iter__(self):
+        for raw in self._lines:
+            self.served += 1
+            yield raw
 
     def __enter__(self):
         return self
@@ -1178,10 +1216,14 @@ class FakeUrlopen:
     passa um `urllib.request.Request` (nunca uma string crua) e o timeout
     como keyword -- é o contrato real de urlopen e a única forma do teste
     provar que nenhum `ollama pull` pendurado trava o loop da ponte.
+
+    Guarda cada resposta em `responses` para o teste do pull poder contar
+    quantas linhas do corpo foram de fato consumidas.
     """
 
     def __init__(self, body=b'{"models": []}', error=None):
         self.calls = []
+        self.responses = []
         self.body = body
         self.error = error
 
@@ -1194,7 +1236,9 @@ class FakeUrlopen:
         })
         if self.error:
             raise self.error
-        return FakeResponse(self.body)
+        response = FakeResponse(self.body)
+        self.responses.append(response)
+        return response
 
 
 TAGS = json.dumps({
@@ -1232,6 +1276,30 @@ def test_a_refused_port_reports_down_instead_of_raising(monkeypatch):
     assert "recusado" in out["error"] or "refused" in out["error"]
 
 
+def test_list_models_survives_a_non_list_models_field(monkeypatch):
+    # {"models": <nao-list>} e o payload que quebra o `int(item.get(...))`:
+    # a tela degrada com erro humano, nunca com excecao no meio do payload.
+    body = json.dumps({"models": "descesperado"}).encode("utf-8")
+    fake = FakeUrlopen(body)
+    monkeypatch.setattr(localmodels, "urlopen", fake)
+    out = localmodels.list_models("http://127.0.0.1:11434")
+    assert out["ok"] is False
+    assert out["models"] == []
+    assert out["error"]
+
+
+def test_list_models_coerces_a_broken_size_to_zero(monkeypatch):
+    # Tamanho e informativo: um valor malformado nao esconde o modelo que o
+    # usuario tem instalado -- cai para 0 / "-" e a listagem continua ok.
+    body = json.dumps({"models": [{"size": "abc"}]}).encode("utf-8")
+    fake = FakeUrlopen(body)
+    monkeypatch.setattr(localmodels, "urlopen", fake)
+    out = localmodels.list_models("http://127.0.0.1:11434")
+    assert out["ok"] is True
+    assert out["models"] == [{"name": "", "size": 0, "sizeHuman": "-",
+                              "params": "", "family": ""}]
+
+
 def test_only_loopback_is_ever_contacted(monkeypatch):
     fake = FakeUrlopen()
     monkeypatch.setattr(localmodels, "urlopen", fake)
@@ -1263,16 +1331,29 @@ def test_pull_streams_lines_then_exits(monkeypatch):
     ) + json.dumps({"status": "success"}).encode() + b"\n"
     fake = FakeUrlopen(body)
     monkeypatch.setattr(localmodels, "urlopen", fake)
-    events = list(localmodels.pull("llama3.2", base="http://127.0.0.1:11434"))
-    assert events[-1] == ("exit", 0)
-    assert ("out", "downloading 50%") in events
-    assert ("out", "success") in events
+    events = []
+    # Consumir aos poucos e quebrar no meio: so assim o teste ve se o
+    # ('out', ...) sai DURANTE o download ou depois de o corpo acabar.
+    for event in localmodels.pull("llama3.2", base="http://127.0.0.1:11434"):
+        events.append(event)
+        if event == ("out", "downloading 50%"):
+            break
+    assert events == [("out", "downloading 0%"), ("out", "downloading 50%")]
+    response = fake.responses[0]
+    # Streaming de verdade: 2 das 4 linhas entregues e NENHUM read() do corpo
+    # inteiro -- com read() o corpo estaria slurpado antes do primeiro evento.
+    assert response.served == 2
+    assert response.served < len(response._lines)
+    assert response.read_calls == 0
+    # timeout SEMPRE como keyword e nunca None: pull pendurado nao congela
+    # o loop stdio da ponte
     call = fake.calls[0]
     assert call["url"].endswith("/api/pull")
     assert json.loads(call["data"]) == {"name": "llama3.2", "stream": True}
-    # timeout SEMPRE como keyword e nunca None: pull pendurado nao congela
-    # o loop stdio da ponte
-    assert call["timeout"] == localmodels.OLLAMA_PROBE_TIMEOUT
+    # teto do pull, NAO o da sonda: 3 s de silencio numa fase `writing blob`
+    # abortaria um download de varios GB no meio
+    assert call["timeout"] == localmodels.OLLAMA_PULL_TIMEOUT
+    assert localmodels.OLLAMA_PULL_TIMEOUT > localmodels.OLLAMA_PROBE_TIMEOUT
 
 
 def test_pull_failure_becomes_exit_1_not_an_exception(monkeypatch):
@@ -1321,7 +1402,7 @@ Contrato verificado na máquina: os consumidores são dois, cada um com seu par
 de variáveis -- a Athena lê `ATHENA_OLLAMA_HOST` / `ATHENA_OLLAMA_MODEL`
 (athena/src/athena/settings.py:52-72, default http://localhost:11434) e o
 Sentinel lê `SENTINEL_OLLAMA_HOST` / `SENTINEL_OLLAMA_MODEL`
-(sentinel/src/sentinel/settings.py:255-279, default http://127.0.0.1:11434 +
+(sentinel/src/sentinel/settings.py:255-283, default http://127.0.0.1:11434 +
 qwen3-coder-next, com veto de host fora de loopback). Os dois só consomem:
 nada aqui instala motor -- o Thero escreve onde apontar.
 
@@ -1339,7 +1420,11 @@ import urllib.request
 from typing import Iterator, Optional
 from urllib.parse import urlparse
 
-from thero.settings import OLLAMA_DEFAULT_HOST, OLLAMA_PROBE_TIMEOUT
+from thero.settings import (
+    OLLAMA_DEFAULT_HOST,
+    OLLAMA_PROBE_TIMEOUT,
+    OLLAMA_PULL_TIMEOUT,
+)
 
 # Dependencia injetavel nos testes; o nome `urlopen` e usado modulo-afora
 # de proposito para o monkeypatch funcionar.
@@ -1390,11 +1475,19 @@ def _describe(error: Exception) -> str:
     return text
 
 
+def _size_of(item: dict) -> int:
+    # Tamanho e informativo: um valor malformado ("abc", None, lista) nao pode
+    # derrubar a listagem inteira -- cai para 0 e o sizeHuman vira "-".
+    try:
+        return int(item.get("size") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def list_models(base: str = "") -> dict:
     url = _guard(base) + "/api/tags"
     # Request com method explicito: o contrato de rede e sempre um objeto
-    # Request (nunca string crua) -- urlopen(string) nao expoe full_url/
-    # get_method/data e quebraria o fake e a uniformidade dos caminhos.
+    # Request (nunca string crua), igual a pull/delete.
     request = urllib.request.Request(url, method="GET")
     try:
         with urlopen(request, timeout=OLLAMA_PROBE_TIMEOUT) as response:
@@ -1406,15 +1499,27 @@ def list_models(base: str = "") -> dict:
         # humano, nunca com AttributeError no meio do payload da ponte.
         return {"ok": False, "models": [],
                 "error": "resposta inesperada do Ollama (/api/tags)"}
+    # Mesma fronteira logo abaixo: {"models": <nao-list>} iteraria as chaves/
+    # letras como se fossem modelos. Lista e o unico formato aceito; chave
+    # ausente e o caso legitimo de "nenhum modelo instalado".
+    raw_models = payload.get("models") or []
+    if not isinstance(raw_models, list):
+        return {"ok": False, "models": [],
+                "error": "resposta inesperada do Ollama (/api/tags)"}
     models = []
-    for item in payload.get("models", []):
-        size = int(item.get("size") or 0)
+    for item in raw_models:
+        # Item que nao seja objeto entra com valores vazios, sem excecao.
+        entry = item if isinstance(item, dict) else {}
+        details = entry.get("details")
+        if not isinstance(details, dict):
+            details = {}
+        size = _size_of(entry)
         models.append({
-            "name": item.get("name", ""),
+            "name": entry.get("name", ""),
             "size": size,
             "sizeHuman": human_bytes(size),
-            "params": (item.get("details") or {}).get("parameter_size", ""),
-            "family": (item.get("details") or {}).get("family", ""),
+            "params": details.get("parameter_size", ""),
+            "family": details.get("family", ""),
         })
     return {"ok": True, "models": models, "error": ""}
 
@@ -1428,8 +1533,11 @@ def human_bytes(size: int) -> str:
 def pull(name: str, base: str = "") -> Iterator[tuple]:
     """Gera ('out', linha) durante o download e ('exit', codigo) no fim.
 
-    O formato e o mesmo de system.process.stream_command, para a ponte tratar
-    `ollama pull` e `npx skills` no mesmo painel de terminal.
+    A resposta e lida INCREMENTALMENTE -- iterar o HTTPResponse em linhas,
+    nao read() do corpo inteiro -- senao nenhum ('out', linha) chega antes
+    de o download acabar e a tela de progresso nao tem o que mostrar.
+    O formato e o mesmo de system.process.stream_command, para a ponte
+    tratar `ollama pull` e `npx skills` no mesmo painel de terminal.
     """
     url = _guard(base) + "/api/pull"
     if not name:
@@ -1442,32 +1550,35 @@ def pull(name: str, base: str = "") -> Iterator[tuple]:
         method="POST",
     )
     try:
-        # timeout SEMPRE como keyword e nunca None (bug corrigido: sem teto,
-        # um `ollama pull` pendurado congela o loop stdio da ponte). O corpo
-        # e lido inteiro com read() e cortado em linhas -- a resposta NAO e
-        # iteravel neste caminho (iterar HTTPResponse/fake daria TypeError).
-        with urlopen(request, timeout=OLLAMA_PROBE_TIMEOUT) as response:
-            payload = response.read()
+        # timeout SEMPRE como keyword e nunca None (sem teto, um `ollama pull`
+        # que pendura congela o loop stdio da ponte). O teto aqui e o do pull,
+        # NAO o da sonda: e leitura por operacao, nao duracao total -- as
+        # fases `verifying sha256`/`writing blob` passam minutos sem emitir
+        # bytes, e 3 s de silencio abortariam um download de varios GB.
+        with urlopen(request, timeout=OLLAMA_PULL_TIMEOUT) as response:
+            # HTTPResponse e iteravel em linhas: o corte incremental e o que
+            # faz os eventos chegarem DURANTE o download.
+            for raw in response:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    yield ("out", line)
+                    continue
+                if not isinstance(event, dict):
+                    # JSON atomico solto na stream ("123", "ok"): vira
+                    # saida crua, nao AttributeError que escaparia pela
+                    # geradora afora.
+                    yield ("out", line)
+                    continue
+                text = event.get("status") or event.get("error") or line
+                yield ("out", text)
     except (urllib.error.URLError, OSError) as exc:
         yield ("out", _describe(exc))
         yield ("exit", 1)
         return
-    for raw in payload.split(b"\n"):
-        line = raw.decode("utf-8", "replace").strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except ValueError:
-            yield ("out", line)
-            continue
-        if not isinstance(event, dict):
-            # JSON atomico solto na stream ("123", "ok"): vira saida crua,
-            # nao AttributeError que escaparia pela geradora.
-            yield ("out", line)
-            continue
-        text = event.get("status") or event.get("error") or line
-        yield ("out", text)
     yield ("exit", 0)
 
 
@@ -1505,7 +1616,7 @@ def status(base: str = "") -> dict:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `276 + 8 = 284 passed`
+Expected: `276 + 10 = 286 passed`
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -1906,7 +2017,7 @@ def blank_from_preset(pid: str, label: str = "") -> dict:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `284 + 13 = 297 passed`
+Expected: `286 + 13 = 299 passed`
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -2403,7 +2514,7 @@ def provider_base(cfg: dict, provider_id: str) -> str:
 # Um par de variaveis por consumidor, com o nome exato que cada um le no
 # proprio codigo e o padrao daquele consumidor quando o usuario nao escolheu:
 #   Athena   -> athena/src/athena/settings.py:52-72
-#   Sentinel -> sentinel/src/sentinel/settings.py:205-243
+#   Sentinel -> sentinel/src/sentinel/settings.py:255-283
 # A lista de consumidores que a UI conhece e `providers.CONSUMERS`; o teste
 # abaixo garante que estas duas fontes nunca divergem.
 ENV_CONTRACTS = {
@@ -2506,7 +2617,7 @@ def apply_all(cfg: dict, paths: dict,
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `297 + 18 = 315 passed` (os testes antigos do comando global cobrem o `upsert_marked_block` delegado e continuam passando)
+Expected: `299 + 18 = 317 passed` (os testes antigos do comando global cobrem o `upsert_marked_block` delegado e continuam passando)
 
 - [ ] **Step 6: Commit (pedir confirmação)**
 
@@ -2890,7 +3001,7 @@ def save_manifest(manifest: dict, path: Optional[Path] = None) -> Path:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `315 + 13 = 328 passed`
+Expected: `317 + 13 = 330 passed`
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -3091,7 +3202,7 @@ reatribuição por:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `328 + 6 = 334 passed` (os testes que cobriam `run_command` continuam passando — comportamento externo inalterado)
+Expected: `330 + 6 = 336 passed` (os testes que cobriam `run_command` continuam passando — comportamento externo inalterado)
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -3978,7 +4089,7 @@ Acrescentar ao `HELP_EPILOG_TEMPLATE`, na seção COMANDOS:
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `334 + 30 = 364 passed`
+Expected: `336 + 30 = 366 passed`
 
 - [ ] **Step 6: Smoke manual do protocolo (sem UI)**
 
@@ -5432,7 +5543,7 @@ def test_the_bridge_command_list_matches_the_ui_vocabulary():
 - [ ] **Step 2: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `364 + 7 = 371 passed`
+Expected: `366 + 7 = 373 passed`
 
 - [ ] **Step 3: Smoke manual da janela**
 
