@@ -209,6 +209,19 @@ def test_loopback_spellings_are_all_accepted():
         assert localmodels._assert_loopback(base) == base
 
 
+def test_guard_base_gates_a_remote_host_before_any_network(monkeypatch):
+    # Publico por causa da Task 4 (providers.register): um satellite precisa
+    # recusar host remoto ANTES de montar o payload de escrita de config, sem
+    # compor os privados (_guard/_assert_loopback) de outro satellite. O veto e
+    # so de URL -- o urlopen fakeado prova que nenhuma chamada sai daqui.
+    fake = FakeUrlopen()
+    monkeypatch.setattr(localmodels, "urlopen", fake)
+    assert localmodels.guard_base("localhost:11434") == "http://localhost:11434"
+    with pytest.raises(ValueError):
+        localmodels.guard_base("http://10.0.0.5:11434")
+    assert fake.calls == []
+
+
 def test_pull_streams_lines_then_exits(monkeypatch):
     body = b"".join(
         json.dumps({"status": "downloading %d%%" % p}).encode() + b"\n"

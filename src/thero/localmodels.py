@@ -82,6 +82,12 @@ def _guard(base: str) -> str:
     return _assert_loopback(normalize_base(base))
 
 
+# Publico por contrato da Task 4 (providers.register): um satellite precisa
+# recusar host remoto ANTES de montar o payload de escrita de config, e nao
+# deve compor os privados (_guard/_assert_loopback) de outro satellite.
+guard_base = _guard
+
+
 def _describe(error: Exception, base: str) -> str:
     if isinstance(error, urllib.error.HTTPError):
         return "HTTP %d %s" % (error.code, error.reason or "")
