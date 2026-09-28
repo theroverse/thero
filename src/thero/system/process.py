@@ -25,6 +25,7 @@ check: bool = False,
 capture: bool = True,
 text: bool = True,
 input_text: str | None = None,
+timeout: float | None = None,
 ) -> subprocess.CompletedProcess:
     """
     Execute a command reliably on Windows and Unix-like systems.
@@ -60,4 +61,5 @@ input_text: str | None = None,
         encoding="utf-8" if text else None,
         input=input_text,
         shell=False,
+        timeout=timeout,
     )
