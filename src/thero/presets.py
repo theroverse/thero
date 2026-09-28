@@ -234,6 +234,21 @@ def default_agents() -> list:
     return out
 
 
+LIMITS = ("local", "standard", "premium")
+
+
+def default_limits() -> dict:
+    """Teto de chamadas simultaneas por tipo de modelo (decisao do dono,
+    2026-09-28). Os valores sao a recomendacao dele, nao um chute: `local` = 4
+    porque o gargalo e o contexto/VRAM da maquina, nao a fatura; `standard` = 3
+    e o meio-termo entre fila e custo; `premium` = 2 porque a cota cara estoura
+    antes de qualquer fila. Quem OBSUSTA o teto e o Zeus (outro satellite,
+    `2026-09-28-zeus-governador-de-modelos`); este modulo e a unica fonte dos
+    numeros -- tela, CLI e ponte leem daqui.
+    """
+    return {"local": 4, "standard": 3, "premium": 2}
+
+
 def default_routing() -> dict:
     # Cada slot comeca com o padrao que aquele proprio consumidor ja usa no
     # codigo dele: Athena = llama3.2 (athena/src/athena/settings.py), Sentinel

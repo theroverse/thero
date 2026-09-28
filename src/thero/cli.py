@@ -4,6 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from thero import config
 from thero.audit.auditor import audit_project, print_audit_workflow
 from thero.claude_md.merger import merge_claude_md
 from thero.integrations.athena_bridge import run_athena_index
@@ -72,6 +73,16 @@ COMANDOS
     --publish-out DIR  Com --publish: escreve sob DIR em vez do
                        diretorio nativo de cada agente (util para
                        testar ou empacotar).
+    --config [K=V]     Le ou escreve ~/.thero/config.json no estilo
+                       "git config" (ex.: --config limits.local=4).
+                       Somente a chave "limits": teto de chamadas
+                       simultaneas por tipo de modelo. Interface e
+                       terminal leem e escrevem a mesma fonte.
+    --config --get K   Com --config: imprime apenas o valor de K
+                       (sai com codigo 1 se a chave nao existe).
+    --config --list    Com --config: lista chave=valor, ordenado,
+                       das seicoes que o terminal entende (limits,
+                       routing, preferences).
     --local            Opera na pasta do projeto atual em vez do
                        usuario global: CLAUDE.md vira ./CLAUDE.md
                        (nao ~/.claude/CLAUDE.md), skills instalam
@@ -477,7 +488,83 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--config",
+        nargs="*",
+        metavar="limits.<tipo>=<int>",
+        default=None,
+        help=(
+            "Le ou escreve ~/.thero/config.json no estilo `git config` "
+            "(ex.: thero --config limits.local=4). Somente a chave `limits`; "
+            "--config --get limits.local e --config --list fazem leitura."
+        ),
+    )
+
+    parser.add_argument(
+        "--get",
+        metavar="limits.<tipo>",
+        default=None,
+        help="Com --config: imprime apenas o valor da chave "
+             "(exit 1 se ausente).",
+    )
+
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="Com --config: lista chave=valor, uma por linha, ordenado.",
+    )
+
     return parser.parse_args()
+
+
+def _config_usage(problem: str) -> None:
+    print("[ERRO] %s" % problem)
+    print()
+    print("Uso:")
+    print("  thero --config limits.local=4       teto de chamadas ao mesmo")
+    print("                                      tempo por tipo de modelo")
+    print("  thero --config --get limits.local    le um valor")
+    print("  thero --config --list               lista o que o terminal le")
+    sys.exit(2)
+
+
+def _dispatch_config(args) -> None:
+    """Le/escreve ~/.thero/config.json no estilo `git config` (Task 6b).
+
+    A MESMA fonte da interface: ~/.thero/config.json, sem cache entre os dois
+    caminhos. Le e gravar escalares; nunca imprime o banner (o `--get` quer
+    ser pipe-avel). `--get` imprime so o valor e sai 1 se a chave nao existe,
+    igual ao git. Escrever so aceita limits.* (ver config.WRITABLE_SECTIONS):
+    provedor e programa tem tela propria, e a regra "nunca gravar valor de
+    chave" nao se negocia por argv.
+    """
+    if args.config is None:
+        _config_usage("--get e --list usam-se com --config "
+                      "(ex.: --config --list).")
+        return
+    if args.get is not None:
+        found, value = config.get_dotted(config.load(), args.get)
+        if not found:
+            sys.exit(1)             # silencio no stdout: git faz o mesmo
+        print(value)
+        return
+    if args.list:
+        for row in config.iter_scalars(config.load()):
+            print(row)
+        return
+    if len(args.config) != 1 or "=" not in args.config[0]:
+        _config_usage("falta o par chave=valor "
+                      "(ex.: --config limits.local=4).")
+        return
+    path, raw = args.config[0].split("=", 1)
+    cfg = config.load()             # le do disco: fonte unica
+    problem = config.set_dotted(cfg, path.strip(), raw.strip())
+    if problem:
+        _config_usage(problem)      # sai 2 aqui: nada e gravado
+        return
+    config.save(cfg)                # atomico, sem BOM (config.py)
+    key = path.strip().split(".")[-1]
+    print("limits.%s=%s" % (key, cfg["limits"][key]))
 
 
 def main(entry_path: Path) -> None:
@@ -491,6 +578,16 @@ def main(entry_path: Path) -> None:
         from thero.mcp.server import serve
 
         serve(entry_path)
+        return
+
+    # ------------------------------------------------------------------
+    # --config, estilo `git config`: a MESMA fonte da interface
+    # (~/.thero/config.json, sem cache entre os dois caminhos). Fica aqui,
+    # antes do banner, porque o banner poluiria a saida de um comando que se
+    # pretende pipe-avel: `--config --get` devolve um valor, nao um relatorio.
+    # ------------------------------------------------------------------
+    if args.config is not None or args.get is not None or args.list:
+        _dispatch_config(args)
         return
 
     print("=" * 70)

@@ -4569,10 +4569,13 @@ dentro do dict de `default_config()` (entre `routing` e `preferences`) e, no fim
 do arquivo, os três helpers de caminho pontilhado:
 
 ```python
-# So `limits` e escrevivel por linha de comando. `routing`, `preferences` sao
-# lidos (`--get`/`--list`) e gravados pelas telas; `providers`/`agents` nem uma
-# coisa nem outra por aqui -- sao listas de estruturas e `providers` e onde vive
-# qualquer nome de variavel de credencial (regra inegociavel 4).
+# ---------------------------------------------------------------------------
+# Caminho pontilhado do `--config` estilo git (Task 6b). So `limits` e
+# escrevivel por linha de comando: `routing` e `preferences` sao lidos e
+# gravados pelas telas, e `providers`/`agents` nem uma coisa nem outra por
+# aqui -- sao listas de estruturas, e `providers` e onde mora qualquer nome
+# de variavel de credencial (regra inegociavel 4 do plano).
+# ---------------------------------------------------------------------------
 WRITABLE_SECTIONS = ("limits",)
 READABLE_SECTIONS = ("limits", "routing", "preferences")
 
@@ -4595,18 +4598,18 @@ def get_dotted(cfg: dict, path: str):
 def set_dotted(cfg: dict, path: str, raw: str):
     """Aplica `limits.<tipo>=<int>` no dict em memoria e devolve o erro humano
     (ou None). NAO grava: quem chama decide quando persistir, para o
-    read-modify-write ser uma operacao só."""
+    read-modify-write ser uma operacao so."""
     parts = path.split(".")
     if len(parts) != 2 or parts[0] not in WRITABLE_SECTIONS:
-        return "%s nao se ajusta por linha de comando: use a interface " \
-               "(ou --config limits.local=4)" % path
+        return ("%s nao se ajusta por linha de comando: use a interface "
+                "(ou --config limits.local=4)" % path)
     section, key = parts
     if section == "limits":
         if key not in presets.LIMITS:
             return "tipo de modelo desconhecido: %s (validos: %s)" % (
                 key, ", ".join(presets.LIMITS))
-        # isdecimal e nao isdigit: "isdigit()" aceita sobrescrito U+00B2, e
-        # int("²") estoura ValueError para fora da CLI com o argv do usuario.
+        # isdecimal e nao isdigit: isdigit() aceita sobrescrito (U+00B2) e
+        # int("2") ali estouraria ValueError para fora da CLI.
         if not raw.lstrip("-").isdecimal():
             return "limits.%s so aceita numero inteiro" % key
         value = int(raw)
@@ -4621,7 +4624,7 @@ def set_dotted(cfg: dict, path: str, raw: str):
 
 def iter_scalars(cfg: dict):
     """`chave=valor` ordenado, uma linha por folha escalar das seicoes que o
-    terminal entende. e o render do `--config --list`; listas ficam de fora
+    terminal entende. E o render do `--config --list`; listas ficam de fora
     por decisao, nao por esquecimento (ver WRITABLE_SECTIONS acima)."""
     rows = []
     for section in READABLE_SECTIONS:
@@ -4645,17 +4648,22 @@ mesma formatação dos vizinhos (`help=` texto longo, sem emoji):
         "--config",
         nargs="*",
         metavar="limits.<tipo>=<int>",
+        default=None,
         help=(
             "Le ou escreve ~/.thero/config.json no estilo `git config` "
             "(ex.: thero --config limits.local=4). Somente a chave `limits`; "
             "--config --get limits.local e --config --list fazem leitura."
         ),
     )
+
     parser.add_argument(
         "--get",
         metavar="limits.<tipo>",
-        help="Com --config: imprime apenas o valor da chave (exit 1 se ausente).",
+        default=None,
+        help="Com --config: imprime apenas o valor da chave "
+             "(exit 1 se ausente).",
     )
+
     parser.add_argument(
         "--list",
         action="store_true",
@@ -4668,31 +4676,49 @@ Em `main()`, **imediatamente depois** do ramo `--mcp` e **antes** do
 comando que se pretende pipe-ável:
 
 ```python
-    # ---------------------------------------------------------------
     # --config, estilo `git config`: a MESMA fonte da interface
-    # (~/.thero/config.json, sem cache entre os dois caminhos). Le/gravar
-    # escalares; nunca imprime o banner. `--get` imprime so o valor e sai 1
-    # se a chave nao existe. Escrever so aceita limits.* (ver
-    # config.WRITABLE_SECTIONS): provedor/programa tem tela propria, e a
-    # regra "nunca gravar valor de chave" nao se negocia por argv.
-    # ---------------------------------------------------------------
+    # (~/.thero/config.json, sem cache entre os dois caminhos). Fica aqui,
+    # antes do banner, porque o banner poluiria a saida de um comando que se
+    # pretende pipe-avel: `--config --get` devolve um valor, nao um relatorio.
+    # ------------------------------------------------------------------
     if args.config is not None or args.get is not None or args.list:
         _dispatch_config(args)
         return
 ```
 
-E a função no mesmo arquivo (antes de `main`):
+E as duas funções no mesmo arquivo (antes de `main`) — `_config_usage()`
+primeiro, porque `_dispatch_config()` a chama três vezes:
 
 ```python
+def _config_usage(problem: str) -> None:
+    print("[ERRO] %s" % problem)
+    print()
+    print("Uso:")
+    print("  thero --config limits.local=4       teto de chamadas ao mesmo")
+    print("                                      tempo por tipo de modelo")
+    print("  thero --config --get limits.local    le um valor")
+    print("  thero --config --list               lista o que o terminal le")
+    sys.exit(2)
+
+
 def _dispatch_config(args) -> None:
+    """Le/escreve ~/.thero/config.json no estilo `git config` (Task 6b).
+
+    A MESMA fonte da interface: ~/.thero/config.json, sem cache entre os dois
+    caminhos. Le e gravar escalares; nunca imprime o banner (o `--get` quer
+    ser pipe-avel). `--get` imprime so o valor e sai 1 se a chave nao existe,
+    igual ao git. Escrever so aceita limits.* (ver config.WRITABLE_SECTIONS):
+    provedor e programa tem tela propria, e a regra "nunca gravar valor de
+    chave" nao se negocia por argv.
+    """
     if args.config is None:
-        _config_usage("--get e --list usam-se com --config (ex.: "
-                      "--config --list).")
+        _config_usage("--get e --list usam-se com --config "
+                      "(ex.: --config --list).")
         return
     if args.get is not None:
         found, value = config.get_dotted(config.load(), args.get)
         if not found:
-            sys.exit(1)                     # silencio ao stderr: git faz o mesmo
+            sys.exit(1)             # silencio no stdout: git faz o mesmo
         print(value)
         return
     if args.list:
@@ -4700,35 +4726,36 @@ def _dispatch_config(args) -> None:
             print(row)
         return
     if len(args.config) != 1 or "=" not in args.config[0]:
-        _config_usage("falta o par chave=valor (ex.: --config limits.local=4).")
+        _config_usage("falta o par chave=valor "
+                      "(ex.: --config limits.local=4).")
         return
     path, raw = args.config[0].split("=", 1)
-    cfg = config.load()                     # le do disco: fonte unica
+    cfg = config.load()             # le do disco: fonte unica
     problem = config.set_dotted(cfg, path.strip(), raw.strip())
     if problem:
-        _config_usage(problem)              # sai 2 aqui: nada e gravado
+        _config_usage(problem)      # sai 2 aqui: nada e gravado
         return
-    config.save(cfg)                        # atomico, sem BOM (config.py:60-72)
-    print("%s.%s=%s" % ("limits", path.split(".")[-1],
-                        cfg["limits"][path.split(".")[-1]]))
-
-
-def _config_usage(problem: str) -> None:
-    print(f"[ERRO] {problem}")
-    print()
-    print("Uso:")
-    print("  thero --config limits.local=4       teto de chamadas simultaneas")
-    print("  thero --config --get limits.local    le um valor")
-    print("  thero --config --list                lista tudo que o terminal le")
-    sys.exit(2)
+    config.save(cfg)                # atomico, sem BOM (config.py)
+    key = path.strip().split(".")[-1]
+    print("limits.%s=%s" % (key, cfg["limits"][key]))
 ```
 
-Acrescentar ao `HELP_EPILOG_TEMPLATE`, na seção COMANDOS:
+Acrescentar ao `_HELP_EPILOG_TEMPLATE` (o nome real tem o `_` da frente), na
+seção COMANDOS, entre `--publish-out` e `--local` — no alinhamento dos vizinhos
+(flag na coluna 5, descrição na 22) e sem o caractere `·`, que não existe em
+nenhuma outra linha do arquivo:
 
 ```
-    --config           Le/escreve ~/.thero/config.json no estilo `git config`.
-                       --config limits.local=4 · --config --get limits.local
-                       --config --list. Somente a chave `limits`.
+    --config [K=V]     Le ou escreve ~/.thero/config.json no estilo
+                       "git config" (ex.: --config limits.local=4).
+                       Somente a chave "limits": teto de chamadas
+                       simultaneas por tipo de modelo. Interface e
+                       terminal leem e escrevem a mesma fonte.
+    --config --get K   Com --config: imprime apenas o valor de K
+                       (sai com codigo 1 se a chave nao existe).
+    --config --list    Com --config: lista chave=valor, ordenado,
+                       das seicoes que o terminal entende (limits,
+                       routing, preferences).
 ```
 
 - [ ] **Step 5: Rodar**
@@ -4784,7 +4811,6 @@ progresso.
 `tests/test_process_stream.py`:
 
 ```python
-import io
 import subprocess
 
 from thero.system import process
@@ -4872,6 +4898,28 @@ def test_shell_is_never_used(monkeypatch):
     list(process.stream_command(["git", "status"], cwd=None))
     assert captured["shell"] is False
     assert captured["argv"] == ["git", "status"]
+
+
+def test_an_empty_command_is_a_line_and_exit_2_not_a_crash(monkeypatch):
+    # run_command() levanta ValueError em vazio (contrato antigo, mantido);
+    # aqui quem chama e a ponte da Task 8, e excecao para fora viraria
+    # traceback no canal JSON. A recusa sai como linha do proprio fluxo.
+    def spy(*a, **k):
+        raise AssertionError("Popen nao pode ser chamado com argv vazio")
+
+    monkeypatch.setattr(process.subprocess, "Popen", spy)
+    out = list(process.stream_command([]))
+    assert out == [("out", "comando vazio"), ("exit", 2)]
+
+
+def test_blank_lines_are_not_streamed_to_the_panel(monkeypatch):
+    # O pull do ollama emite linha em branco entre as barras de progresso;
+    # mandar ("out", "") para a janela acrescenta vazio ao painel sem saida
+    # nenhuma, entao o filtro e contrato, nao enfeite.
+    monkeypatch.setattr(process.subprocess, "Popen",
+                        lambda *a, **k: FakePopen(["a\n", "\n", "\r\n", "b"]))
+    out = list(process.stream_command(["ollama", "pull", "llama3.2"]))
+    assert out == [("out", "a"), ("out", "b"), ("exit", 0)]
 ```
 
 - [ ] **Step 2: Rodar para confirmar falha**
@@ -4895,25 +4943,64 @@ WINDOWS_LAUNCHERS = {
 
 
 def _with_windows_launcher(command: list[str]) -> list[str]:
-    """npm/Claude instalam .cmd no PATH; sem o executavel certo o CreateProcess falha."""
+    """npm/Claude instalam .cmd no PATH; sem o executavel certo o
+    CreateProcess falha no Windows e nao existe subprocess que sobreviva a
+    isso. Fora do Windows (ou com argv vazio) a lista passa intacta."""
     if os.name != "nt" or not command:
         return list(command)
-    executable = WINDOWS_LAUNCHERS.get(command[0], command[0])
-    return [executable, *command[1:]]
+    return [WINDOWS_LAUNCHERS.get(command[0], command[0]), *command[1:]]
+
+
+def run_command(
+command: list[str],
+*,
+cwd: Path | None = None,
+check: bool = False,
+capture: bool = True,
+text: bool = True,
+input_text: str | None = None,
+timeout: float | None = None,
+) -> subprocess.CompletedProcess:
+    """
+    Execute a command reliably on Windows and Unix-like systems.
+
+    Windows installs npm/Claude CLI launchers as .cmd files.
+    Explicitly use the Windows launcher when necessary.
+    """
+    if not command:
+        raise ValueError("Command cannot be empty.")
+
+    command = _with_windows_launcher(command)
+
+    # Sem "encoding" explícito, o Windows decodifica stdout/stderr
+    # usando a codepage do console (ex.: cp1252), corrompendo
+    # acentos que o Claude retorna em UTF-8.
+    return subprocess.run(
+        command,
+        cwd=str(cwd) if cwd else None,
+        check=check,
+        capture_output=capture,
+        text=text,
+        encoding="utf-8" if text else None,
+        input=input_text,
+        shell=False,
+        timeout=timeout,
+    )
 
 
 def stream_command(
     command: list[str],
     *,
     cwd: Path | None = None,
-) -> "Generator[tuple, None, None]":
+) -> Iterator[tuple]:
     """
     Roda `command` e produz ('out', linha) durante a execucao e ('exit',
     codigo) no fim.
 
     stderr vai para o mesmo fluxo (npm e ollama escrevem progresso la).
     `encoding="utf-8"` explicito: no Windows o padrao e a codepage do
-    console, que corrompe acento.
+    console, que corrompe acento. Nunca levanta: quem chama e a ponte da
+    Task 8, e excecao para fora viraria traceback no canal JSON.
     """
     if not command:
         yield ("out", "comando vazio")
