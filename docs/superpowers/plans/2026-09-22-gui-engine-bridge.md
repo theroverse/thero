@@ -652,9 +652,14 @@ git commit -m "feat(config): add provider/agent presets and the ~/.thero/config.
 `tests/test_envreport.py`:
 
 ```python
-from pathlib import Path
+from __future__ import annotations
 
-from thero import envreport
+import json
+
+import pytest
+
+from thero import apply
+from thero.shell_command import upsert_block, upsert_marked_block
 from thero.settings import (
     COMMAND_MARKER_END,
     COMMAND_MARKER_START,
@@ -663,223 +668,361 @@ from thero.settings import (
 )
 
 
-class FakeWhich:
-    def __init__(self, found):
-        self.found = set(found)
+# ---- upsert_block generico (detecta os marcadores ja dentro do bloco) ----
 
-    def __call__(self, name):
-        return "/usr/bin/%s" % name if name in self.found else None
-
-
-def _patched(monkeypatch, found, runner=None, ollama=None):
-    monkeypatch.setattr(envreport, "_which", FakeWhich(found))
-    monkeypatch.setattr(envreport, "_version_probe",
-                        runner or (lambda cmd: ("%s ok" % cmd[0], True)))
-    monkeypatch.setattr(envreport, "_ollama_probe",
-                        lambda: ollama or {"up": False, "host": "", "models": [],
-                                           "error": ""})
-    monkeypatch.setattr(envreport, "_profile_path", lambda: None)
+def test_upsert_block_appends_when_absent():
+    out = upsert_block("echo oi\n", ">>>\nblock\n<<<", ">>>", "<<<")
+    assert out.startswith("echo oi")
+    assert ">>>\nblock\n<<<" in out
 
 
-def _home(tmp_path):
-    skills = tmp_path / ".claude" / "skills"
-    (skills / "react").mkdir(parents=True)
-    (skills / "react" / "SKILL.md").write_text("# react", encoding="utf-8")
-    (tmp_path / ".claude" / "CLAUDE.md").write_text("x" * 40, encoding="utf-8")
-    return tmp_path
+def test_upsert_block_replaces_instead_of_duplicating():
+    first = upsert_block("", ">>>\nA\n<<<", ">>>", "<<<")
+    second = upsert_block(first, ">>>\nC\n<<<", ">>>", "<<<")
+    assert second.count(">>>") == 1
+    assert "C" in second and "A" not in second
 
 
-def _snap(tmp_path, monkeypatch, found, runner=None, ollama=None):
-    _patched(monkeypatch, found, runner, ollama)
-    home = _home(tmp_path)
-    return envreport.snapshot(entry_path=Path("thero.py"), home=home,
-                              config_path=tmp_path / ".thero" / "config.json")
+def test_upsert_block_keeps_text_after_the_marker():
+    existing = "antes\n>>>\nvelho\n<<<\ndepois\n"
+    out = upsert_block(existing, ">>>\nnovo\n<<<", ">>>", "<<<")
+    assert "antes" in out and "depois" in out
+    assert "novo" in out and "velho" not in out
 
 
-def test_reports_every_program_the_ui_asks_about(tmp_path, monkeypatch):
-    s = _snap(tmp_path, monkeypatch, ["node", "npx", "claude"])
-    assert {"node", "npx", "claude", "git"} <= set(s["tools"])
-    assert s["tools"]["claude"]["found"] is True
-    assert s["tools"]["node"]["ok"] is True
+def test_upsert_block_does_not_cannibalize_other_marked_blocks():
+    # dois pares de marcadores distintos no mesmo arquivo: trocar um par nao
+    # pode engolir o outro (a busca por index(end) acha o fim do MESMO bloco).
+    existing = ">>X\nalpha\n<<X\n>>Y\nbeta\n<<Y\n"
+    out = upsert_block(existing, ">>X\nALPHA\n<<X", ">>X", "<<X")
+    assert "ALPHA" in out and "alpha" not in out
+    assert ">>Y\nbeta\n<<Y" in out
+    out2 = upsert_block(out, ">>Y\nBETA\n<<Y", ">>Y", "<<Y")
+    assert "BETA" in out2 and ">>X\nALPHA\n<<X" in out2
 
 
-def test_broken_npx_is_reported_as_present_but_failing(tmp_path, monkeypatch):
-    # estado REAL desta maquina em 2026-09-22: o shim existe e morre no
-    # npm-prefix (exit != 0) -- e o returncode, nao o texto, que diz isso.
-    s = _snap(tmp_path, monkeypatch, ["node", "npx"],
-              runner=lambda cmd: ("Error: Cannot find module ...npm-prefix.js",
-                                  False))
-    assert s["tools"]["npx"]["found"] is True
-    assert s["tools"]["npx"]["ok"] is False
-    assert "npm-prefix" in s["tools"]["npx"]["detail"]
+def test_marked_block_still_uses_the_command_markers():
+    block = "%s\nfunction thero {}\n%s" % (COMMAND_MARKER_START,
+                                           COMMAND_MARKER_END)
+    out = upsert_marked_block("", block)
+    assert COMMAND_MARKER_START in out and COMMAND_MARKER_END in out
 
 
-def test_tool_without_version_output_is_not_ok(tmp_path, monkeypatch):
-    # exit 0 sem saida tambem nao confirma nada
-    s = _snap(tmp_path, monkeypatch, ["node"], runner=lambda cmd: ("", True))
-    assert s["tools"]["node"]["found"] is True
-    assert s["tools"]["node"]["ok"] is False
+# ---- claude settings.json ----
+
+@pytest.fixture
+def cfg():
+    return {
+        "providers": [
+            {"id": "claude", "label": "Claude Code", "model": "sonnet",
+             "authKind": "session", "authVar": "", "base": ""},
+            {"id": "ollama", "label": "Ollama", "model": "llama3.2",
+             "authKind": "local", "authVar": "",
+             "base": "http://127.0.0.1:11434"},
+        ],
+        "agents": [
+            {"id": "claude", "preset": "claude", "target": "claude",
+             "provider": "claude", "model": "sonnet", "enabled": True},
+        ],
+        "routing": {"athena": "llama3.2", "sentinel": "qwen3-coder-next"},
+    }
 
 
-def test_missing_tool_has_ok_false(tmp_path, monkeypatch):
-    s = _snap(tmp_path, monkeypatch, ["node"])
-    assert s["tools"]["claude"]["found"] is False
-    assert s["tools"]["claude"]["ok"] is False
+def test_apply_claude_sets_model_and_env_anthropic_model(tmp_path, cfg):
+    target = tmp_path / "settings.json"
+    target.write_text(json.dumps({"autoUpdatesChannel": "latest"}),
+                      encoding="utf-8")
+    agent = apply.find_agent(cfg, "claude")
+    out = apply.apply_claude(agent, cfg, target)
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert data["model"] == "sonnet"
+    assert data["env"]["ANTHROPIC_MODEL"] == "sonnet"
+    assert data["autoUpdatesChannel"] == "latest"   # preservou o resto
+    assert out["ok"] is True
+    assert out["written"] == str(target)
 
 
-def test_a_hanging_version_probe_becomes_empty_instead_of_a_frozen_gui(monkeypatch):
-    # O motor da ponte e um loop de stdio: se `claude --version` travar sem
-    # responder, a janela inteira para. A sonda precisa de teto.
-    import subprocess
-
-    seen = {}
-
-    def fake_run(command, **kw):
-        seen["command"] = command
-        seen["timeout"] = kw.get("timeout")
-        raise subprocess.TimeoutExpired(command, kw.get("timeout") or 0)
-
-    monkeypatch.setattr(envreport, "run_command", fake_run)
-    assert envreport._version_probe(["claude"]) == ("", False)
-    assert seen["command"] == ["claude", "--version"]
-    assert seen["timeout"] == 10
+def test_apply_claude_backs_up_before_touching(tmp_path, cfg):
+    target = tmp_path / "settings.json"
+    target.write_text(json.dumps({"env": {"X": "1"}}), encoding="utf-8")
+    apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
+    backups = list(tmp_path.glob("settings.backup_*"))
+    assert len(backups) == 1
+    saved = json.loads(backups[0].read_text(encoding="utf-8"))
+    assert saved["env"]["X"] == "1"
 
 
-def test_a_hanging_profile_probe_becomes_none_instead_of_a_frozen_gui(monkeypatch):
-    # Espelho da sonda de versao: `powershell -NoProfile -Command $PROFILE`
-    # sem teto e o mesmo congelamento, no mesmo loop de stdio.
-    import subprocess
-
-    from thero.shell_command import windows
-
-    seen = {}
-
-    def fake_run(command, **kw):
-        seen["command"] = command
-        seen["timeout"] = kw.get("timeout")
-        raise subprocess.TimeoutExpired(command, kw.get("timeout") or 0)
-
-    monkeypatch.setattr(windows, "run_command", fake_run)
-    monkeypatch.setattr(envreport.platform, "system", lambda: "Windows")
-    assert envreport._profile_path() is None
-    assert seen["command"] == ["powershell", "-NoProfile", "-Command", "$PROFILE"]
-    assert seen["timeout"] == envreport.PROFILE_TIMEOUT == 5
+def test_apply_refuses_an_unparseable_file_and_leaves_it_alone(tmp_path, cfg):
+    target = tmp_path / "settings.json"
+    target.write_text("{ isto nao e json", encoding="utf-8")
+    out = apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
+    assert out["ok"] is False
+    assert "nao fui" in out["msg"].lower() or "parse" in out["msg"].lower()
+    assert target.read_text(encoding="utf-8") == "{ isto nao e json"
+    assert list(tmp_path.glob("settings.backup_*")) == []
+    assert out["backup"] == ""
 
 
-def test_profile_probe_survives_a_broken_import(monkeypatch):
-    # O import tardio tem de viver DENTRO da fronteira protegida: modulo
-    # injetavel/quebrado degrada so o campo profilePath, nunca o payload.
-    import sys
-
-    monkeypatch.setattr(envreport.platform, "system", lambda: "Windows")
-    monkeypatch.setitem(sys.modules, "thero.shell_command.windows", None)
-    assert envreport._profile_path() is None
-
-
-def test_a_denied_skills_folder_counts_zero_without_killing_the_snapshot(tmp_path, monkeypatch):
-    # PermissionError em UM item da fronteira fs nao derruba a tela de Status.
-    _patched(monkeypatch, ["node"])
-    home = _home(tmp_path)
-    skills = home / ".claude" / "skills"
-    real_iterdir = Path.iterdir
-
-    def iterdir(self):
-        if self == skills:
-            raise PermissionError(13, "negada")
-        return real_iterdir(self)
-
-    monkeypatch.setattr(Path, "iterdir", iterdir)
-    s = envreport.snapshot(entry_path=Path("thero.py"), home=home,
-                           config_path=tmp_path / ".thero" / "config.json")
-    assert s["skills"]["installed"] == 0
-    assert s["claudeMd"]["exists"] is True
-    assert s["tools"]["node"]["ok"] is True
+def test_apply_claude_creates_env_without_clobbering_other_vars(tmp_path, cfg):
+    target = tmp_path / "settings.json"
+    target.write_text(json.dumps({"env": {"ANTHROPIC_API_KEY": "kept"}}),
+                      encoding="utf-8")
+    apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert data["env"]["ANTHROPIC_API_KEY"] == "kept"
+    assert data["env"]["ANTHROPIC_MODEL"] == "sonnet"
 
 
-def test_a_denied_claude_md_degrades_only_its_field(tmp_path, monkeypatch):
-    # TOCTOU na fronteira fs: `exists()` disse sim, `stat()` nega logo
-    # depois -- so o campo claudeMd degrada, o resto do snapshot sai inteiro.
-    _patched(monkeypatch, ["node"])
-    home = _home(tmp_path)
-    claude_md = home / ".claude" / "CLAUDE.md"
-    real_stat = Path.stat
-    real_exists = Path.exists
-
-    def stat(self, *args, **kw):
-        if self == claude_md:
-            raise PermissionError(13, "negada")
-        return real_stat(self, *args, **kw)
-
-    monkeypatch.setattr(Path, "stat", stat)
-    monkeypatch.setattr(
-        Path, "exists",
-        lambda self: True if self == claude_md else real_exists(self))
-    s = envreport.snapshot(entry_path=Path("thero.py"), home=home,
-                           config_path=tmp_path / ".thero" / "config.json")
-    assert s["claudeMd"] == {"exists": False, "bytes": 0, "backups": 0}
-    assert s["skills"]["installed"] == 1
+def test_apply_claude_targets_the_agent_it_is_given(tmp_path, cfg):
+    # A4: sem o `agent` em mao o escritor fixaria id "claude" e escreveria o
+    # modelo do agente errado num segundo alvo "claude".
+    cfg["agents"].append(dict(cfg["agents"][0], id="claude2",
+                              target="claude", provider="ollama",
+                              model="llama3.2"))
+    target = tmp_path / "settings.json"
+    target.write_text("{}", encoding="utf-8")
+    second = apply.find_agent(cfg, "claude2")
+    apply.apply_claude(second, cfg, target)
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert data["model"] == "llama3.2"
 
 
-def test_nonzero_exit_with_clean_stdout_is_not_ok(monkeypatch):
-    # Fim da adivinhacao pelo texto: exit != 0 imprimindo saida "limpa"
-    # reporta ok False porque o sucesso vem do returncode real.
-    class Result:
-        returncode = 3
-        stdout = "Thero wrapper pronto"
-        stderr = ""
+# ---- opencode ----
 
-    monkeypatch.setattr(envreport, "run_command", lambda cmd, **kw: Result())
-    assert envreport._version_probe(["claude"]) == ("Thero wrapper pronto", False)
-
-
-def test_ollama_absent_is_up_false_with_host(tmp_path, monkeypatch):
-    s = _snap(tmp_path, monkeypatch, ["node"],
-              ollama={"up": False, "host": "http://127.0.0.1:11434",
-                      "models": [], "error": "conexao recusada"})
-    assert s["ollama"]["up"] is False
-    assert s["ollama"]["modelCount"] == 0
-    assert s["ollama"]["error"] == "conexao recusada"
+def test_apply_opencode_writes_provider_slash_model(tmp_path, cfg):
+    target = tmp_path / "opencode.json"
+    target.write_text(json.dumps({"theme": "opencode"}), encoding="utf-8")
+    agent = dict(cfg["agents"][0], preset="opencode", target="opencode",
+                 provider="ollama", model="llama3.2")
+    apply.apply_opencode(agent, cfg, target)
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert data["model"] == "ollama/llama3.2"
+    assert data["theme"] == "opencode"
 
 
-def test_first_run_counts_and_fixed_command_name(tmp_path, monkeypatch):
-    s = _snap(tmp_path, monkeypatch, ["node"])
-    assert s["app"] == "thero"
-    assert s["firstRun"] is True
-    assert s["skills"]["installed"] == 1
-    assert s["claudeMd"]["exists"] is True
-    assert s["claudeMd"]["bytes"] == 40
-    assert s["commandName"] == "thero"       # nome fixo, nunca editavel
-    assert s["scope"] == "global"
+# ---- codex config.toml ----
 
-
-def test_env_block_alone_does_not_count_as_installed_command(tmp_path):
-    # A Task 5 escreve o bloco de ENV no MESMO $PROFILE e o bloco cita
-    # "thero"; a checagem casa o marcador do comando global, nao substring.
-    profile = tmp_path / "profile.ps1"
-    profile.write_text(
-        "%s\n$env:THERO_OLLAMA_MODEL = 'thero-local'\n%s\n"
-        % (ENV_MARKER_START, ENV_MARKER_END),
+def test_apply_codex_rewrites_only_top_level_scalars(tmp_path, cfg):
+    target = tmp_path / "config.toml"
+    target.write_text(
+        'model = "old"\nnotify = true\n\n[mcp_servers.x]\ncmd = "keep me"\n',
         encoding="utf-8",
     )
-    assert envreport._command_installed(profile) is False
+    agent = dict(cfg["agents"][0], target="codex", provider="openai",
+                 model="gpt-5-codex")
+    apply.apply_codex(agent, cfg, target)
+    text = target.read_text(encoding="utf-8")
+    assert 'model = "gpt-5-codex"' in text
+    assert "notify = true" in text
+    assert 'cmd = "keep me"' in text
+    assert text.index("notify") < text.index("[mcp_servers")
 
 
-def test_command_marker_in_profile_counts_as_installed(tmp_path):
+def test_apply_codex_creates_the_key_when_the_file_has_none(tmp_path, cfg):
+    target = tmp_path / "config.toml"
+    target.write_text('[features]\nx = true\n', encoding="utf-8")
+    agent = dict(cfg["agents"][0], target="codex", model="gpt-5-codex")
+    apply.apply_codex(agent, cfg, target)
+    text = target.read_text(encoding="utf-8")
+    assert text.splitlines()[0].startswith("model")
+    assert "[features]" in text
+
+
+def test_apply_codex_writes_model_provider_only_when_the_table_exists(tmp_path,
+                                                                      cfg):
+    target = tmp_path / "config.toml"
+    target.write_text('model = "old"\n\n[model_providers.deepseek]\n'
+                      'base_url = "http://x"\n', encoding="utf-8")
+    agent = dict(cfg["agents"][0], target="codex", provider="deepseek",
+                 model="deepseek-chat")
+    apply.apply_codex(agent, cfg, target)
+    text = target.read_text(encoding="utf-8")
+    assert 'model = "deepseek-chat"' in text
+    assert 'model_provider = "deepseek"' in text
+    assert "[model_providers.deepseek]" in text
+
+
+def test_apply_codex_skips_model_provider_when_the_table_is_absent(tmp_path,
+                                                                   cfg):
+    target = tmp_path / "config.toml"
+    target.write_text('model = "old"\nnotify = true\n', encoding="utf-8")
+    agent = dict(cfg["agents"][0], target="codex", provider="ghost",
+                 model="gpt-x")
+    out = apply.apply_codex(agent, cfg, target)
+    text = target.read_text(encoding="utf-8")
+    assert 'model = "gpt-x"' in text
+    assert "model_provider" not in text   # mesa inexistente quebraria o Codex
+    assert "ghost" in out["msg"]          # o msg diz por que nao escreveu
+
+
+# ---- $PROFILE (contrato real dos dois consumidores) ----
+
+def test_profile_block_carries_both_consumer_contracts(cfg):
+    block = apply.profile_env_block(cfg)
+    assert "$env:ATHENA_OLLAMA_HOST" in block
+    assert "$env:ATHENA_OLLAMA_MODEL" in block
+    assert "$env:SENTINEL_OLLAMA_HOST" in block
+    assert "$env:SENTINEL_OLLAMA_MODEL" in block
+    # cada consumidor com o modelo que o usuario escolheu para ele -- os dois
+    # padrao sao diferentes (Athena llama3.2, Sentinel qwen3-coder-next)
+    assert '$env:ATHENA_OLLAMA_MODEL = "llama3.2"' in block
+    assert '$env:SENTINEL_OLLAMA_MODEL = "qwen3-coder-next"' in block
+    assert block.count("http://127.0.0.1:11434") == 2
+    assert ENV_MARKER_START in block and ENV_MARKER_END in block
+
+
+def test_profile_block_falls_back_to_each_consumers_own_default(cfg):
+    cfg["routing"] = {}                       # usuario ainda nao escolheu
+    block = apply.profile_env_block(cfg)
+    assert '$env:ATHENA_OLLAMA_MODEL = "llama3.2"' in block
+    assert '$env:SENTINEL_OLLAMA_MODEL = "qwen3-coder-next"' in block
+
+
+def test_env_contracts_cover_exactly_the_declared_consumers():
+    # duas listas de consumidores e a receita de uma tela que escreve no
+    # arquivo errado: isto garante que apply.ENV_CONTRACTS e
+    # providers.CONSUMERS nunca divergem.
+    from thero import providers
+
+    assert set(apply.ENV_CONTRACTS) == set(providers.CONSUMERS)
+
+
+def test_apply_profile_is_idempotent(tmp_path, cfg):
+    profile = tmp_path / "Microsoft.PowerShell_profile.ps1"
+    profile.write_text("function foo {}\n", encoding="utf-8")
+    apply.apply_profile(cfg, profile)
+    apply.apply_profile(cfg, profile)
+    text = profile.read_text(encoding="utf-8")
+    assert text.count(ENV_MARKER_START) == 1
+    assert "function foo" in text
+
+
+def test_apply_profile_reports_missing_profile_without_crashing(cfg):
+    # A8: Path(None) levanta TypeError; a validacao tem de vir antes.
+    out = apply.apply_profile(cfg, None)
+    assert out["ok"] is False
+    assert "profile" in out["msg"].lower()
+
+
+def test_profile_env_block_refuses_a_remote_ollama_base(cfg):
+    # A3: base remota escolhida na GUI nunca pode virar $PROFILE.
+    for provider in cfg["providers"]:
+        if provider.get("id") == "ollama":
+            provider["base"] = "http://10.0.0.5:11434"
+    with pytest.raises(ValueError):
+        apply.profile_env_block(cfg)
+
+
+def test_apply_profile_refuses_remote_base_and_writes_nothing(tmp_path, cfg):
+    # A3 + credencial: base remota com userinfo nao escreve, nao faz backup,
+    # e nao ecoa a credencial no msg.
+    for provider in cfg["providers"]:
+        if provider.get("id") == "ollama":
+            provider["base"] = "http://user:secret@evil.example:11434"
     profile = tmp_path / "profile.ps1"
-    profile.write_text(
-        "%s\nfunction thero { python thero.py }\n%s\n"
-        % (COMMAND_MARKER_START, COMMAND_MARKER_END),
-        encoding="utf-8",
-    )
-    assert envreport._command_installed(profile) is True
+    profile.write_text("function foo {}\n", encoding="utf-8")
+    out = apply.apply_profile(cfg, profile)
+    assert out["ok"] is False
+    assert "loopback" in out["msg"].lower()
+    assert profile.read_text(encoding="utf-8") == "function foo {}\n"
+    assert list(tmp_path.glob("profile.backup_*")) == []
+    assert "secret" not in out["msg"]
+    assert "user" not in out["msg"]
 
 
-def test_config_present_flips_first_run(tmp_path, monkeypatch):
-    cfg = tmp_path / ".thero" / "config.json"
-    cfg.parent.mkdir(parents=True)
-    cfg.write_text("{}", encoding="utf-8")
-    s = _snap(tmp_path, monkeypatch, ["node"])
-    assert s["firstRun"] is False
+def test_apply_preserves_a_cp1252_profile_byte_for_byte(tmp_path, cfg):
+    # A7: um $PROFILE salvo como cp1252 (PowerShell 5.1) nao pode virar
+    # U+FFFD escrito de volta -- merge preservando o encoding de origem.
+    profile = tmp_path / "profile.ps1"
+    profile.write_bytes("# caf\xe9 latino\nfunction foo {}\n".encode("cp1252"))
+    out = apply.apply_profile(cfg, profile)
+    assert out["ok"] is True
+    data = profile.read_bytes()
+    assert b"caf\xe9" in data
+    assert b"\xef\xbf\xbd" not in data
+    assert ENV_MARKER_START.encode() in data
+
+
+def test_apply_refuses_an_undecodable_file_and_writes_nothing(tmp_path, cfg):
+    # A7: nem utf-8 nem cp1252 -> recusa total, arquivo intocado, sem backup.
+    target = tmp_path / "settings.json"
+    junk = b'{"a": 1}\n\x81'
+    target.write_bytes(junk)
+    out = apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
+    assert out["ok"] is False
+    assert target.read_bytes() == junk
+    assert list(tmp_path.glob("settings.backup_*")) == []
+    assert out["backup"] == ""
+
+
+# ---- despacho / record-only / ponte ----
+
+def test_apply_never_uses_print_on_the_bridge_channel(tmp_path, cfg, capsys):
+    target = tmp_path / "settings.json"
+    target.write_text("{}", encoding="utf-8")
+    apply.apply_agent(cfg["agents"][0], cfg, {"claude": target})
+    agent = dict(cfg["agents"][0], id="env", target="profile")
+    apply.apply_agent(agent, cfg, {}, tmp_path / "profile.ps1")
+    assert capsys.readouterr().out == ""
+
+
+def test_record_only_targets_write_nothing(tmp_path, cfg):
+    target = tmp_path / "settings.json"
+    before = "{}"
+    target.write_text(before, encoding="utf-8")
+    agent = dict(cfg["agents"][0], target="none", preset="qoder")
+    out = apply.apply_agent(agent, cfg, {"claude": target})
+    assert out["ok"] is True
+    assert out["writes"] is False
+    assert target.read_text(encoding="utf-8") == before
+
+
+def test_record_only_result_carries_id_and_target(tmp_path, cfg):
+    # A5: a ponte casa os resultados por `id`; sem id o recod-only nunca daria
+    # match e o status ficaria "pendente" para sempre.
+    agent = dict(cfg["agents"][0], id="cursor", target="none", preset="cursor")
+    out = apply.apply_agent(agent, cfg, {})
+    assert out["id"] == "cursor"
+    assert out["target"] == "none"
+
+
+def test_apply_all_reports_enabled_and_skips_disabled(tmp_path, cfg):
+    cfg["agents"].append(dict(cfg["agents"][0], id="x", enabled=False))
+    paths = {"claude": tmp_path / "settings.json"}
+    paths["claude"].write_text("{}", encoding="utf-8")
+    results = apply.apply_all(cfg, paths)
+    assert len(results) == 1
+    assert results[0]["id"] == "claude"
+
+
+def test_default_paths_has_no_profile_key():
+    # A9: localizar a $PROFILE exige rodar PowerShell -- default_paths nao faz
+    # subprocess, entao nao finge um contrato que nao entrega.
+    assert "profile" not in apply.default_paths()
+
+
+def test_apply_agent_resolves_profile_from_paths_key(tmp_path, cfg):
+    profile = tmp_path / "profile.ps1"
+    agent = {"id": "env", "target": "profile", "label": "Perfil"}
+    out = apply.apply_agent(agent, cfg, {"profile": profile})
+    assert out["ok"] is True
+    assert out["target"] == "profile"
+    assert ENV_MARKER_START in profile.read_text(encoding="utf-8")
+
+
+def test_apply_returns_the_backup_name_when_overwriting(tmp_path, cfg):
+    target = tmp_path / "settings.json"
+    target.write_text("{}", encoding="utf-8")
+    out = apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
+    assert out["backup"].startswith("settings.backup_")
+    assert out["backup"] in out["msg"]     # msg menciona o que foi tocado
+
+
+def test_apply_backup_is_empty_when_no_prior_file(tmp_path, cfg):
+    target = tmp_path / "settings.json"
+    out = apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
+    assert out["backup"] == ""             # arquivo novo: nao houve backup
+    assert "settings.json" in out["msg"]
 ```
 
 - [ ] **Step 2: Rodar → falha**
@@ -2430,6 +2573,7 @@ git commit -m "feat(providers): provider registry that never reads or echoes key
 
 **Files:**
 - Modify: `src/thero/shell_command/__init__.py` (função genérica `upsert_block`)
+- Modify: `src/thero/providers.py` (expor `redact`, redação de credencial já existente em `_redact`)
 - Create: `src/thero/apply.py`
 - Test: `tests/test_apply.py`
 
@@ -2438,6 +2582,42 @@ git commit -m "feat(providers): provider registry that never reads or echoes key
 `$PROFILE` usa marcadores próprios (`ENV_MARKER_START/END`) para um upsert não
 engolir o outro. Em vez de copiar a lógica, extraio a versão genérica e deixo
 a atual delegando — comportamento das chamadas existentes não muda.
+
+**Correções da auditoria costurada nos blocos abaixo (A1-A9, já refletidas no
+código final e nos testes byte-idênticos):**
+
+- **A1/A2 — marcadores vêm DENTRO do bloco.** `upsert_block`/`upsert_marked_block`
+  DETECTAM e substituem, nunca injetam: quem chama traz o bloco já emoldurado
+  (`windows.py:143-149` faz exatamente isso). Os testes antigos presumiam
+  injeção; foram corrigidos para a forma real (`">>>\nblock\n<<<"`). Injetar
+  duplicaria os marcadores no `$PROFILE` e quebraria o comando global.
+  `upsert_marked_block` mantém a assinatura de 2 argumentos.
+- **A2 (canibalismo).** A busca por `index(end)` na primeira ocorrência pode
+  casar com marcador de outro bloco; há um teste com dois pares distintos na
+  mesma `$PROFILE` provando que trocar um não toca no outro.
+- **A3 — loopback na origem da escrita.** `_ollama_base` delega a
+  `localmodels.guard_base`: base remota levanta `ValueError`. `apply_profile`
+  captura e devolve recusa SEM escrever, com o motivo redigido por
+  `providers.redact` (novo wrapper público sobre `_redact`, sem copiar regex).
+- **A4 — `apply_claude(agent, cfg, path)`** recebe o agente do despacho (com
+  fallback para id `"claude"` quando `None`), igual a opencode/codex.
+- **A5 — `id`/`target` em TODO retorno** de `apply_agent`, inclusive o
+  record-only: a ponte casa por `id`, senão Qoder/VS Code/Cline/Cursor ficam
+  "pendente" para sempre.
+- **A6 — `model_provider` só com a mesa existente.** `apply_codex` escreve
+  `model_provider` apenas se `[model_providers.<id>]` estiver no corpo; senão
+  escreve só `model` e explica no `msg`.
+- **A7 — leitura sem `errors="replace"`.** `_read_text` tenta utf-8 (tolera
+  BOM na leitura, escreve sem BOM) → cp1252 (preservado byte a byte) → recusa
+  sem tocar no arquivo. Proibido regravar com U+FFFD um `$PROFILE`/`config.toml`
+  salvo como cp1252.
+- **A8 — `apply_profile` valida `None` antes de virar `Path`.**
+- **A9 — `default_paths()` NÃO tem chave `profile`** (localizar a `$PROFILE`
+  exige rodar PowerShell; o `paths.get("profile")` no despacho só existe se o
+  chamador injeta-lo).
+- **Produto — backup e aviso na tela.** Todo retorno traz `"backup"` (nome do
+  arquivo criado, ou `""` quando não houve) e o `msg` menciona o que foi
+  tocado. O backup fica na máquina, nunca é versionado nem enviado.
 
 - [ ] **Step 1: Testes**
 
@@ -2673,8 +2853,10 @@ def upsert_block(
 ) -> str:
     """
     Troca (ou acrescenta) `block` dentro de `existing`, reconhecendo pelos
-    marcadores `start`/`end`. Idempotente: rodar duas vezes nao duplica,
-    e o texto depois do marcador final continua la.
+    marcadores `start`/`end`. O bloco ja traz os proprios marcadores (como o
+    template do comando global): a funcao DETECTA e substitui, nunca injeta --
+    injetar duplicaria os marcadores no arquivo. Idempotente: rodar duas
+    vezes nao duplica, e o texto depois do marcador final continua la.
     """
     block = block.strip("\n") + "\n"
 
@@ -2722,15 +2904,19 @@ Create `src/thero/apply.py`:
 """Escritores de configuracao: o Thero aplicando provedor+modelo nos programas.
 
 So escrevem onde o formato foi CONFIRMADO nesta maquina:
-  claude    -> ~/.claude/settings.json      (chave "model" + env.ANTHROPIC_MODEL)
+  claude    -> ~/.claude/settings.json       (chave "model" + env.ANTHROPIC)
   opencode  -> ~/.config/opencode/opencode.json  ("model": "provedor/modelo")
-  codex     -> ~/.codex/config.toml         (escalares de topo model/model_provider)
-  profile   -> $PROFILE                     (blocos ATHENA_OLLAMA_* e SENTINEL_OLLAMA_*)
+  codex     -> ~/.codex/config.toml          (escalares topo model/provider)
+  profile   -> $PROFILE                      (blocos ATHENA_/SENTINEL_OLLAMA_)
 O resto (Qoder, VS Code, Cline, Cursor...) e record-only: `writes=False`,
 o Thero anota a intencao e nao encosta no arquivo de ninguem.
 
 Regras caras: backup antes de escrever, merge em vez de substituir, e NUNCA
-escrever em arquivo que nao se consegue reler (parse fallback => recusa).
+escrever em arquivo que nao se consegue reler como texto (nem utf-8 nem
+cp1252 => recusa sem tocar). Um provedor local com base fora de loopback e
+recusado na origem (A3): o valor vai parar em $env:ATHENA_OLLAMA_HOST que a
+Athena le sem validacao. Todo retorno traz `written`, `backup` e um `msg` que
+diz o que foi tocado -- a tela mostra, o usuario sabe.
 Nada aqui usa print(): a GUI fala com o motor por stdout como canal JSON.
 """
 
@@ -2741,7 +2927,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from thero import providers
+from thero import localmodels, providers
 from thero.shell_command import upsert_block
 from thero.settings import (
     ENV_MARKER_END,
@@ -2752,6 +2938,10 @@ from thero.system.process import timestamp
 
 
 def default_paths(home: Optional[Path] = None) -> dict:
+    # Deliberadamente SEM chave "profile": localizar a $PROFILE exige rodar
+    # PowerShell (envreport._profile_path), e default_paths nao faz subprocess.
+    # apply_agent aceita paths["profile"] so quando o proprio chamador o
+    # injeta; a ponte passa a $PROFILE resolvida no argumento `profile`.
     home = Path(home) if home else Path.home()
     return {
         "claude": home / ".claude" / "settings.json",
@@ -2765,19 +2955,23 @@ def find_agent(cfg: dict, agent_id: str) -> Optional[dict]:
                 None)
 
 
-def _backup(path: Path) -> Optional[Path]:
-    """Silencioso de proposito.
+def _backup(path: Path) -> str:
+    """Copia silenciosa ANTES de tocar; devolve o NOME do backup (ou "").
 
-    system.backup.backup_file() faz print() de OK -- ótimo no terminal, e o
-    canal da ponte eh JSON. Aqui o backup e um efeito colateral, nao uma
-    mensagem.
+    system.backup.backup_file() faz print() -- otimo no terminal, e o canal da
+    ponte e JSON. Aqui o backup e efeito colateral, nao mensagem. Fica na
+    maquina: nunca e versionado nem enviado.
     """
     if not path.exists():
-        return None
+        return ""
     target = path.with_name(
         "%s.backup_%s%s" % (path.stem, timestamp(), path.suffix))
     shutil.copy2(str(path), str(target))
-    return target
+    return target.name
+
+
+def _backup_note(backup: str) -> str:
+    return " (backup: %s)" % backup if backup else ""
 
 
 def _model_of(cfg: dict, agent: dict) -> str:
@@ -2788,41 +2982,70 @@ def _model_of(cfg: dict, agent: dict) -> str:
     return (provider or {}).get("model", "")
 
 
+def _read_text(path: Path):
+    """Le texto SEM corromper -> (texto, encoding_de_escrita) ou None.
+
+    Proibido errors="replace" num caminho que regrava: um $PROFILE/config.toml
+    salvo como cp1252 (comum no PowerShell 5.1) viraria U+FFFD escrito de volta
+    -- perda byte a byte. utf-8-sig tolera BOM na leitura (escrevemos sem BOM);
+    cp1252 so quando o utf-8 falha, e ai PRESERVA o cp1252. Nem um nem outro =>
+    None, e o chamador recusa sem tocar no arquivo.
+    """
+    try:
+        return path.read_text(encoding="utf-8-sig"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+    try:
+        return path.read_text(encoding="cp1252"), "cp1252"
+    except UnicodeDecodeError:
+        return None
+
+
+def _refuse(msg: str) -> dict:
+    return {"ok": False, "written": "", "backup": "", "msg": msg}
+
+
 def _write_json_target(path: Path, mutate) -> dict:
     """Le JSON (tolerando BOM), aplica `mutate`, escreve so se parsear.
 
-    Arquivo ausente comeca de {}; arquivo ilegivel e recusado sem toque.
+    Arquivo ausente comeca de {}; ilegivel como texto ou JSON invalido e
+    recusado sem toque e sem backup.
     """
-    if not path.exists():
-        data = {}
-        original = None
-    else:
-        original = path.read_text(encoding="utf-8-sig", errors="replace")
+    path = Path(path)
+    encoding = "utf-8"
+    if path.exists():
+        read = _read_text(path)
+        if read is None:
+            return _refuse("nao consegui ler %s como texto" % path)
+        original, encoding = read
         try:
             data = json.loads(original)
         except ValueError:
-            return {"ok": False,
-                    "msg": "nao fui em %s: nao e JSON valido" % path}
+            return _refuse("nao fui em %s: nao e JSON valido" % path)
         if not isinstance(data, dict):
-            return {"ok": False,
-                    "msg": "nao fui em %s: o JSON nao e um objeto" % path}
+            return _refuse("nao fui em %s: o JSON nao e um objeto" % path)
+    else:
+        data = {}
     data = mutate(data) or data
-    _backup(path)
+    backup = _backup(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+        encoding=encoding,
     )
-    return {"ok": True, "written": str(path),
-            "msg": "atualizado: %s" % path.name}
+    return {"ok": True, "written": str(path), "backup": backup,
+            "msg": "atualizado: %s%s" % (path.name, _backup_note(backup))}
 
 
-def apply_claude(cfg: dict, path: Path) -> dict:
-    agent = find_agent(cfg, "claude") or {}
+def apply_claude(agent, cfg: dict, path: Path) -> dict:
+    # `agent` chega do despacho; None -> agente de id "claude" (compat com
+    # chamada direta). Nunca fixar "claude" no corpo: um segundo agente com
+    # target="claude" escreveria o modelo do agente errado.
+    if agent is None:
+        agent = find_agent(cfg, "claude") or {}
     model = _model_of(cfg, agent)
     if not model:
-        return {"ok": False, "written": "",
-                "msg": "sem modelo definido para o Claude Code"}
+        return _refuse("sem modelo definido para o Claude Code")
 
     def mutate(data):
         data["model"] = model
@@ -2840,14 +3063,24 @@ def apply_opencode(agent: dict, cfg: dict, path: Path) -> dict:
     provider = agent.get("provider") or "local"
     model = _model_of(cfg, agent)
     if not model:
-        return {"ok": False, "written": "",
-                "msg": "sem modelo definido para o OpenCode"}
+        return _refuse("sem modelo definido para o OpenCode")
 
     def mutate(data):
         data["model"] = "%s/%s" % (provider, model)
         return data
 
     return _write_json_target(Path(path), mutate)
+
+
+def _codex_has_provider_table(lines, provider: str) -> bool:
+    """Mesma mesa [model_providers.<id>] que o Codex usa ao resolver."""
+    exact = "[model_providers.%s]" % provider
+    sub = "[model_providers.%s." % provider
+    for line in lines:
+        stripped = line.strip()
+        if stripped == exact or stripped.startswith(sub):
+            return True
+    return False
 
 
 def apply_codex(agent: dict, cfg: dict, path: Path) -> dict:
@@ -2860,12 +3093,15 @@ def apply_codex(agent: dict, cfg: dict, path: Path) -> dict:
     path = Path(path)
     model = _model_of(cfg, agent)
     if not model:
-        return {"ok": False, "written": "",
-                "msg": "sem modelo definido para o Codex"}
+        return _refuse("sem modelo definido para o Codex")
+    encoding = "utf-8"
     lines = []
     if path.exists():
-        lines = path.read_text(encoding="utf-8-sig",
-                               errors="replace").splitlines()
+        read = _read_text(path)
+        if read is None:
+            return _refuse("nao consegui ler %s como texto" % path)
+        original, encoding = read
+        lines = original.splitlines()
     table_index = len(lines)
     for index, line in enumerate(lines):
         if line.strip().startswith("["):
@@ -2876,8 +3112,16 @@ def apply_codex(agent: dict, cfg: dict, path: Path) -> dict:
 
     wanted = {"model": '"%s"' % model}
     provider = agent.get("provider") or ""
+    skipped_provider = ""
     if provider:
-        wanted["model_provider"] = '"%s"' % provider
+        # Apontar model_provider para uma mesa [model_providers.<id>] que nao
+        # existe QUEBRA o Codex (na maquina real o arquivo ja tem, p.ex.,
+        # model_provider = "deepseek" com a mesa la). So escrevo se a mesa
+        # existir no corpo; senao escrevo apenas `model` e aviso no msg.
+        if _codex_has_provider_table(lines, provider):
+            wanted["model_provider"] = '"%s"' % provider
+        else:
+            skipped_provider = provider
 
     consumed = set()
     out = []
@@ -2895,11 +3139,14 @@ def apply_codex(agent: dict, cfg: dict, path: Path) -> dict:
             out.append("%s = %s" % (key, value))
     out.extend(tail)
 
-    _backup(path)
+    backup = _backup(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(out) + "\n", encoding="utf-8")
-    return {"ok": True, "written": str(path),
-            "msg": "atualizado: %s" % path.name}
+    path.write_text("\n".join(out) + "\n", encoding=encoding)
+    msg = "atualizado: %s%s" % (path.name, _backup_note(backup))
+    if skipped_provider:
+        msg += (": mantive o model_provider do arquivo porque a mesa "
+                "[model_providers.%s] nao existe nele" % skipped_provider)
+    return {"ok": True, "written": str(path), "backup": backup, "msg": msg}
 
 
 def provider_base(cfg: dict, provider_id: str) -> str:
@@ -2923,49 +3170,70 @@ ENV_CONTRACTS = {
 
 
 def _ollama_base(cfg: dict) -> str:
-    """Host do motor local: aceita o provedor Ollama pelo preset ou pelo id."""
+    """Host do motor local, VALIDADO como loopback antes de virar $PROFILE.
+
+    O valor aqui escrito chega a ATHENA_OLLAMA_HOST, que a Athena le sem
+    validacao; so o Sentinel veta por conta propria. Entao o veto mora AQUI:
+    delegar ao localmodels.guard_base (nao reimplementar a regex de loopback).
+    Base remota -> ValueError (com a base crua no texto; quem chama redige).
+    """
     for provider in cfg.get("providers", []):
-        if provider.get("preset") == "ollama" or provider.get("id") == "ollama":
-            return provider.get("base") or OLLAMA_DEFAULT_HOST
+        if not isinstance(provider, dict):
+            continue
+        is_ollama = (provider.get("preset") == "ollama"
+                     or provider.get("id") == "ollama")
+        if is_ollama:
+            return localmodels.guard_base(
+                provider.get("base") or OLLAMA_DEFAULT_HOST)
     return OLLAMA_DEFAULT_HOST
 
 
 def profile_env_block(cfg: dict) -> str:
-    """O contrato real dos dois consumidores locais, num bloco so da $PROFILE."""
+    """Contrato dos dois consumidores locais, num bloco so da $PROFILE."""
     routing = cfg.get("routing") or {}
+    base = _ollama_base(cfg)
     lines = [
         ENV_MARKER_START,
         "# Gerado pelo Thero. Editar na interface do Thero (Modelos locais).",
     ]
     for consumer in providers.CONSUMERS:
         host_var, model_var, fallback = ENV_CONTRACTS[consumer]
-        lines.append('$env:%s = "%s"' % (host_var, _ollama_base(cfg)))
+        lines.append('$env:%s = "%s"' % (host_var, base))
         lines.append('$env:%s = "%s"'
                      % (model_var, routing.get(consumer) or fallback))
     lines.append(ENV_MARKER_END)
     return "\n".join(lines)
 
 
-def apply_profile(cfg: dict, profile: Path) -> dict:
-    profile = Path(profile)
+def apply_profile(cfg: dict, profile) -> dict:
+    # Valida ANTES de converter: Path(None) levanta TypeError e o msg de
+    # "$PROFILE nao localizada" ficaria inalcancavel.
     if profile is None or not str(profile):
-        return {"ok": False, "written": "",
-                "msg": "nao localizei a $PROFILE do PowerShell"}
+        return _refuse("nao localizei a $PROFILE do PowerShell")
+    profile = Path(profile)
+    try:
+        block = profile_env_block(cfg)
+    except ValueError as exc:
+        return _refuse("modelos locais so em loopback: %s"
+                       % providers.redact(exc))
     existing = ""
+    encoding = "utf-8"
     if profile.exists():
-        existing = profile.read_text(encoding="utf-8-sig", errors="replace")
+        read = _read_text(profile)
+        if read is None:
+            return _refuse("nao consegui ler %s como texto" % profile)
+        existing, encoding = read
     elif not profile.parent.exists():
-        return {"ok": False, "written": "",
-                "msg": "pasta da $PROFILE nao existe: %s" % profile.parent}
-    _backup(profile) if profile.exists() else None
+        return _refuse("pasta da $PROFILE nao existe: %s" % profile.parent)
+    backup = _backup(profile)
     profile.parent.mkdir(parents=True, exist_ok=True)
     profile.write_text(
-        upsert_block(existing, profile_env_block(cfg),
-                     ENV_MARKER_START, ENV_MARKER_END),
-        encoding="utf-8",
+        upsert_block(existing, block, ENV_MARKER_START, ENV_MARKER_END),
+        encoding=encoding,
     )
-    return {"ok": True, "written": str(profile),
-            "msg": "ambiente Athena/Sentinel atualizado na $PROFILE"}
+    return {"ok": True, "written": str(profile), "backup": backup,
+            "msg": "ambiente Athena/Sentinel atualizado na $PROFILE%s"
+                   % _backup_note(backup)}
 
 
 TARGETS = ("claude", "opencode", "codex", "profile")
@@ -2974,32 +3242,33 @@ TARGETS = ("claude", "opencode", "codex", "profile")
 def apply_agent(agent: dict, cfg: dict, paths: dict,
                 profile: Optional[Path] = None) -> dict:
     target = agent.get("target") or "none"
+    # id/target presentes em TODO retorno: a ponte casa os resultados por
+    # `id` no apply-all; sem isso o recod-only (Qoder/VS Code/Cline/Cursor)
+    # nunca daria match e o status ficaria "pendente" para sempre.
+    base = {"id": agent.get("id", target), "target": target}
     label = agent.get("label") or agent.get("id", "")
     if target not in TARGETS:
-        return {"ok": True, "writes": False, "written": "",
-                "msg": "%s: registrado no Thero (o arquivo desse programa "
-                       "nao expoe chave verificavel)" % label}
+        return dict(base, ok=True, writes=False, written="", backup="",
+                    msg="%s: registrado no Thero (o arquivo desse programa "
+                        "nao expoe chave verificavel)" % label)
     if target == "profile":
         where = profile or paths.get("profile")
         if not where:
-            return {"ok": False, "writes": True, "written": "",
-                    "msg": "$PROFILE nao encontrada nesta maquina"}
+            return dict(base, ok=False, writes=True, written="", backup="",
+                        msg="$PROFILE nao encontrada nesta maquina")
         out = apply_profile(cfg, Path(where))
     else:
         where = paths.get(target)
         if not where:
-            return {"ok": False, "writes": True, "written": "",
-                    "msg": "sem caminho conhecido para %s" % target}
+            return dict(base, ok=False, writes=True, written="", backup="",
+                        msg="sem caminho conhecido para %s" % target)
         if target == "claude":
-            out = apply_claude(cfg, Path(where))
+            out = apply_claude(agent, cfg, Path(where))
         elif target == "opencode":
             out = apply_opencode(agent, cfg, Path(where))
         else:
             out = apply_codex(agent, cfg, Path(where))
-    out["writes"] = True
-    out["id"] = agent.get("id", target)
-    out["target"] = target
-    return out
+    return dict(base, writes=True, **out)
 
 
 def apply_all(cfg: dict, paths: dict,
@@ -3015,12 +3284,12 @@ def apply_all(cfg: dict, paths: dict,
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `319 + 18 = 337 passed` (os testes antigos do comando global cobrem o `upsert_marked_block` delegado e continuam passando)
+Expected: `362 + 32 = 394 passed` (baseline atual da Task 4 e 362, nao 319; os testes antigos do comando global cobrem o `upsert_marked_block` delegado e continuam passando).
 
 - [ ] **Step 6: Commit (pedir confirmação)**
 
 ```bash
-git add src/thero/shell_command/__init__.py src/thero/apply.py tests/test_apply.py
+git add src/thero/shell_command/__init__.py src/thero/providers.py src/thero/apply.py tests/test_apply.py
 git commit -m "feat(apply): write provider+model into verified targets only, with backup and merge"
 ```
 
