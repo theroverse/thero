@@ -52,9 +52,18 @@
 ## Decisões do dono (2026-09-28, terceira rodada) — onde cada uma foi prescrita
 
 Quatro respostas dele chegaram **depois** de a Task 6 estar cometada (`095086e`,
-416 passed). Nada delas é código escrito na árvore: cada uma virou **bloco
+416 passed na época). Nada delas é código escrito na árvore: cada uma virou **bloco
 prescritivo dentro da task que o executor já vai reescrever**, para não nascer
 por cima das costuras que a auditoria marcou como quebradas.
+
+> **Estado da branch enquanto este bloco foi escrito (medido, não deduzido):**
+> um executor paralelo trabalhou na mesma branch e o `416` já não é a base —
+> `219e0ec` revisou e comitou esta Task 6b + o Step 4D, `b4bb7ec` **executou a
+> Task 7** (`tests/test_process_stream.py` com **8** `def test_`, não os 6
+> prescritos) e `0287c92` somou o LM Studio. `python -m pytest tests/ -q` hoje =
+> **442 passed**. Todas as contagens abaixo estão reliquadas contra esse número,
+> e a regra de re-meIDA em cada Step "Rodar" é `grep -c "^def test"` + a suíte
+> inteira, nunca a aritmética desta página.
 
 | # | Decisão (palavra dele) | Onde está prescrita | O que o executor encontra |
 |---|---|---|---|
@@ -79,7 +88,12 @@ inegociáveis acima; um executor que contrarie qualquer uma delas para):
 - **Instalar/de-download do Ollama pertence a
   `docs/superpowers/plans/2026-09-28-instalacao-do-engine-local.md`** (outro
   trabalho — ver "Fora deste plano", fim do arquivo). Este plano só **lê** a
-  máquina para dizer se existe alguma coisa a iniciar.
+  máquina para dizer se existe alguma coisa a iniciar. O ciclo de vida sob
+  demanda mora no módulo **novo** `src/thero/engineproc.py`, e **não** em
+  `localmodels.py` — que o outro plano crava como cliente HTTP puro, sem gestão
+  de processo. A divergência de política entre as duas frases está declarada no
+  Task 8 Step 4D ("COLISÃO DECLARADA") e vai ao dono; ninguém resolve isso
+  editando o plano do outro.
 - **Tetos vivem numa chave só, escrita por um `set_dotted` fechado.** A CLI
   escreve **somente** `limits.*`; nada de `--config` tocar `providers.*` — é
   onde mora qualquer coisa parecida com credencial, e a regra inegociável 4
@@ -4343,16 +4357,15 @@ Fatos verificados nesta máquina (não inventar nada além disso):
 5. `config.json` é arquivo **nosso** (Task 1) — a regra inegociável 6 (backup
    antes de escrever arquivo de terceiro) não se aplica aqui.
 
-> **Costura em aberto (não fingir que existe).** Esta task referencia
-> `limits-get`/`limits-set` da **Task 8 Step 4E** e a tela do **Task 10 Step
-> 6D** — nenhum dos dois está escrito no plano ainda (o Step 4D do ciclo de
-> vida do Ollama e os Steps 6B/6C da Task 10 prometidos na tabela de cobertura
-> do Task 0 também faltavam; o 4D foi escrito depois, os outros continuam
-> pendentes). Quem executar a Task 8 deve escrever o Step 4E ANTES de tocar em
-> código — mesma fonte, com o cache do `BridgeState` contornado na leitura de
-> `limits`, porque a janela precisa ver o que o terminal gravou. Executar a
-> Task 6b isolada não deixa nada pendurado: a chave, os defaults e a CLI vivem
-> só em `presets.py`/`config.py`/`cli.py`.
+> **Ordem de execução (não há costura faltando, há dependência).** As quatro
+> decisões do dono estão todas prescritas: Task 6b (chave + CLI), Task 8 Steps
+> 4B/4C/4D/4E (progresso, worker/cancelamento, ciclo do motor, `limits-get`/
+> `limits-set`), Task 9 Step 2B (host assíncrono), Task 10 Steps 6B/6C/6D
+> (barra, Iniciar/Reiniciar, tela dos tetos) e Task 11 Step 1B (os estáticos).
+> O que vale é a sequência: **a Task 6b precisa rodar antes do Step 4E**,
+> porque `presets.LIMITS`, `presets.default_limits()` e a chave `limits` em
+> `config.default_config()` nascem lá, e o validador do 4E os importa. Rodar a
+> 6b isolada não pendura nada: ela vive só em `presets.py`/`config.py`/`cli.py`.
 
 - [ ] **Step 1: Testes**
 
@@ -5904,8 +5917,7 @@ def test_progress_human_bytes_and_pct_are_consistent(monkeypatch):
     assert progress["completed"] == 1024 and progress["total"] == 2048
 ```
 
-- [ ] **Step 4C: baixa longa = worker dedicado + cancelamento + recusa de
-  concorrência (decisão 1 do dono, 2026-09-28)**
+- [ ] **Step 4C: baixa longa = worker dedicado + cancelamento + recusa de concorrência (decisão 1, 2026-09-28)**
 
 Por que precisa existir: o `serve()` do Step 3 le **uma** linha de stdin por vez
 e e single-thread. O ramo `if cmd == "models-pull"` consome a geradora **dentro**
@@ -6184,8 +6196,7 @@ def test_a_plain_line_carries_no_extra_keys(state, monkeypatch): ...
 > protege o `test_run_accepts_a_known_flag_and_streams_lines` do Step 1). Se um
 > contrato não fechar como escrito, **parar e reportar**, não afrouxar o teste.
 
-- [ ] **Step 4D: motor local ausente — checar / iniciar / reiniciar (decisão 3
-  do dono, 2026-09-28)**
+- [ ] **Step 4D: motor local ausente — checar / iniciar / reiniciar (decisão 3, 2026-09-28)**
 
 Palavra dele: *"precisamos apenas checar o status e iniciar ou mesmo reiniciar
 caso necessario (o ollama)"*. As três operações, cada uma com gatilho explícito e
@@ -6194,8 +6205,8 @@ contrato de retorno:
 | Operação | Gatilho explícito | Quem faz | Contrato de retorno |
 |---|---|---|---|
 | **checar status** | sempre passivo, sem processo: abrir a tela, "Reescanear", hidratar | **já existe** — `localmodels.status()` via `models-status` | `{"up": bool, "base": str, "models": [...], "error": str}` |
-| **iniciar** | botão "Iniciar Ollama" quando `up` é false; **ou** um clique que precisa do motor (Baixar / Reescanear) com ele caído. **Nunca** no arranque da janela | `engine-start` → `localmodels.start()` | `{"ok","up","started","pending","msg"}` |
-| **reiniciar** | **só** clique do usuário, ou logo depois de mudança de config que exija isso, avisando o que vai acontecer. Nenhum outro caminho chama | `engine-restart` → `localmodels.restart()` | `{"ok","up","restarted","stopped","msg"}` |
+| **iniciar** | botão "Iniciar Ollama" quando `up` é false; **ou** um clique que precisa do motor (Baixar / Reescanear) com ele caído. **Nunca** no arranque da janela | `engine-start` → `engineproc.start()` | `{"ok","up","started","pending","msg"}` |
+| **reiniciar** | **só** clique do usuário, ou logo depois de mudança de config que exija isso, avisando o que vai acontecer. Nenhum outro caminho chama | `engine-restart` → `engineproc.restart()` | `{"ok","up","restarted","stopped","msg"}` |
 
 Regras duras (em código + teste, não em comentário): **nunca manter o motor
 vivo** (nenhum watcher, nenhum retry em background, nenhuma thread de
@@ -6203,18 +6214,63 @@ monitoramento); **nenhum spawn permanente atrelado à janela** (o filho é
 desanexado: fechar o Thero não o derruba — é o oposto deliberado do
 `python --serve`, que cai com a janela); **nenhum binário no nosso payload**
 (Task 12 confere); **se o Ollama já existe na máquina, perguntar antes de instalar
-qualquer coisa** — e instalar **não é deste plano**: dono é
-`docs/superpowers/plans/2026-09-28-instalacao-do-engine-local.md`. **Passo de
-verificação desta subseção: `ls docs/superpowers/plans/`** — na branch atual ele
-**não** está na árvore (só `2026-09-22-gui-engine-bridge.md`, mais o
-`2026-09-28-registro-de-equipe.md` não-rastreado de outro trabalho), então a
-dependência fica declarada aqui e a UI deste plano oferece **só**
-"Iniciar"/"Reiniciar", nunca "Instalar".
+qualquer coisa** — e instalar **não é deste plano**.
+
+> **COLISÃO DECLARADA entre os dois planos (lida hoje, 2026-09-28, não
+> escondida).** `docs/superpowers/plans/2026-09-28-instalacao-do-engine-local.md`
+> apareceu na árvore (não-rastreado) **depois** de este despacho ter sido escrito,
+> e ele existe: Tasks 1-15, módulos `enginedata/artifactcheck/download/
+> engineinstall/localep`. Duas frases dele brigam com a decisão 3 do dono:
+>
+> - linha 22: *"nosso programa **nunca** é dono do processo: nunca spawnamos
+>   `ollama serve`, nunca matamos, nunca reiniciamos"*;
+> - linha 2162+: `assert_not_lifecycle` + `LIFECYCLE_WORDS = {"serve","start",
+>   "stop","kill","restart",...}` e `test_nothing_we_generate_looks_like_engine_
+>   ownership` (linha 2520) recusando exatamente `["ollama","serve"]` e
+>   `["taskkill","/IM","ollama.exe"]`.
+>
+> A palavra **mais recente** do dono é a deste plano (memória
+> `local-engine-install-not-owned-by-our-apps`: "a regra não é 'nunca tocar no
+> processo', é 'não ser o pai dele'; ações de ciclo de vida sob demanda são
+> permitidas"). Consequências práticas, na ordem:
+>
+> 1. **O passo de verificação é `ls docs/superpowers/plans/`** — se o plano de
+>    instalação estiver lá, a dependência está declarada e resolvida: ele é o
+>    dono do instalar/de-download; este plano só oferece Iniciar/Reiniciar.
+> 2. As travas dele são **escopadas aos módulos dele** (`MODULES` =
+>    engineinstall/download/localep/enginedata; `localmodels.py` não está na
+>    lista), então nada aqui quebra os testes dele — **desde que** o ciclo de
+>    vida more em `engineproc.py` (por isso ele nasce num módulo novo e não dentro
+>    de `localmodels.py`, que o outro plano declara "único cliente do Ollama, sem
+>    gestão de processo").
+> 3. **Quem executa este plano NÃO edita o outro.** A divergência de política
+>    (linha 22) vai **ao dono** como pergunta única, com as duas frases na mão; o
+>    conservadorismo continua do lado dele: nunca matar por nome de imagem, nunca
+>    manter vivo, nunca instalar sem perguntar.
+> 4. Rodar antes do commit desta task, para não descobrir depois:
+>    ```bash
+>    python -m pytest tests/ -q -k "ownership or lifecycle"
+>    ```
+>    Expected: nada falha. Se o outro plano já estiver executado e alguma trava
+>    sua for repo-wide (não escopada a `MODULES`), **parar e reportar** — a
+>    correção é no plano dele, não aqui.
 
 Acrescentar em `src/thero/settings.py` (junto dos outros tetos, linhas 49-57) e
-em `src/thero/localmodels.py` (fim do arquivo; `status()` e o `urlparse` já
-importado servem; **acrescentar os imports que faltam** — `os`, `shutil`,
-`subprocess`, `time`; o módulo hoje só importa `http.client/json/re/urllib`):
+no **módulo novo** `src/thero/engineproc.py` (criar o arquivo; stdlib apenas —
+`os`, `shutil`, `subprocess`, `time`, e `from thero import localmodels` para a
+sonda; **`localmodels.py` não ganha gestão de processo**, é a fronteira que o
+outro plano já marcou):
+
+```python
+"""Ciclo de vida SOB DEMANDA do Ollama do usuario: existe? esta no ar? levanta,
+se o usuario pedir. Para de la.
+
+Este modulo nao hospeda o motor e nao o mantem vivo: quem chama `start()` nao
+guarda o objeto Popen, e nenhum watchpoint, timer ou retry em background existe
+aqui. Instalar/baixar o binario pertence a
+docs/superpowers/plans/2026-09-28-instalacao-do-engine-local.md. Proibido
+print(): vive no processo da ponte, cujo stdout e o canal JSON.
+"""
 
 ```python
 # settings.py
@@ -6228,6 +6284,15 @@ OLLAMA_START_WAIT = 6      # segundos esperando o daemon responder DENTRO do
 ```
 
 ```python
+import os
+import shutil
+import subprocess
+import time
+from urllib.parse import urlparse
+
+from thero import localmodels
+from thero.settings import OLLAMA_START_WAIT
+
 OLLAMA_WINDOWS_DIRS = (
     r"%LOCALAPPDATA%\Programs\Ollama\ollama.exe",   # onde o instalador manual poe
     r"%ProgramFiles%\Ollama\ollama.exe",
@@ -6268,7 +6333,7 @@ def start(wait: int = OLLAMA_START_WAIT) -> dict:
                 "msg": "Ollama nao esta nesta maquina. Instalar e passo do "
                        "plano 2026-09-28-instalacao-do-engine-local.md; o "
                        "Thero nao baixa motor nem embute binario."}
-    if status()["up"]:
+    if localmodels.status()["up"]:
         return {"ok": True, "up": True, "started": False, "pending": False,
                 "msg": "O Ollama ja esta no ar: nada a iniciar."}
     creationflags = 0
@@ -6286,7 +6351,7 @@ def start(wait: int = OLLAMA_START_WAIT) -> dict:
         return {"ok": False, "up": False, "started": False, "pending": False,
                 "msg": "nao consegui iniciar %s: %s" % (binary, exc)}
     for _ in range(max(1, int(wait))):
-        if status()["up"]:
+        if localmodels.status()["up"]:
             return {"ok": True, "up": True, "started": True, "pending": False,
                     "msg": "Ollama no ar (%s)." % binary}
         time.sleep(1)
@@ -6329,7 +6394,7 @@ def restart(wait: int = OLLAMA_START_WAIT) -> dict:
     if os.name != "nt":
         return {"ok": False, "up": False, "restarted": False, "stopped": False,
                 "msg": "reiniciar o Ollama so esta implementado no Windows."}
-    parsed = urlparse(status()["base"])
+    parsed = urlparse(localmodels.status()["base"])
     port = parsed.port or 11434
     pid = _pid_on_port(port)
     if pid:
@@ -6349,14 +6414,15 @@ def restart(wait: int = OLLAMA_START_WAIT) -> dict:
 ```
 
 Handlers na ponte — **o único lugar de todo o repositório que chama
-`start()`/`restart()`** (`_handle_models`, ao lado de `models-status`):
+`engineproc.start()`/`engineproc.restart()`** (`_handle_models`, ao lado de
+`models-status`; `from thero import engineproc` entra nos imports do `bridge.py`):
 
 ```python
     if cmd == "engine-start":
-        return _ok(request["id"], {"engine": localmodels.start(),
+        return _ok(request["id"], {"engine": engineproc.start(),
                                    "ollama": localmodels.status(base)})
     if cmd == "engine-restart":
-        return _ok(request["id"], {"engine": localmodels.restart(),
+        return _ok(request["id"], {"engine": engineproc.restart(),
                                    "ollama": localmodels.status(base)})
 ```
 
@@ -6368,22 +6434,35 @@ Handlers na ponte — **o único lugar de todo o repositório que chama
 > impede alguém de "unificar" os dois caminhos depois. A Task 11 Step 1B prende
 > isto em teste estático (`localmodels.start(` aparece **uma** vez no arquivo).
 
-Testes (**+5 em `tests/test_localmodels.py`**, corpos completos):
+Testes (**+5 no arquivo novo `tests/test_engineproc.py`**, corpos completos —
+o `from thero import engineproc, localmodels` no topo é o que permite monkeypatchar
+`engineproc.localmodels.status`, porque é assim que o módulo lê o retrato):
 
 ```python
+"""Ciclo de vida sob demanda, sem nunca ser o pai do motor.
+
+Regra do repo (e do outro plano): nenhum teste abre socket nem gerou processo --
+tudo injetado na costura publica do modulo.
+"""
+
+import pytest
+
+from thero import engineproc, localmodels
+
+
 def test_find_binary_prefers_the_path_then_the_known_dirs(monkeypatch, tmp_path):
     exe = tmp_path / "ollama.exe"
     exe.write_text("", encoding="utf-8")
-    monkeypatch.setattr(localmodels.shutil, "which", lambda n: str(exe))
-    assert localmodels.find_binary() == str(exe)
-    monkeypatch.setattr(localmodels.shutil, "which", lambda n: None)
-    monkeypatch.setattr(localmodels.os.path, "isfile", lambda p: False)
-    assert localmodels.find_binary() == ""
+    monkeypatch.setattr(engineproc.shutil, "which", lambda n: str(exe))
+    assert engineproc.find_binary() == str(exe)
+    monkeypatch.setattr(engineproc.shutil, "which", lambda n: None)
+    monkeypatch.setattr(engineproc.os.path, "isfile", lambda p: False)
+    assert engineproc.find_binary() == ""
 
 
 def test_start_without_the_binary_points_at_the_other_plan(monkeypatch):
-    monkeypatch.setattr(localmodels, "find_binary", lambda: "")
-    out = localmodels.start()
+    monkeypatch.setattr(engineproc, "find_binary", lambda: "")
+    out = engineproc.start()
     assert out["ok"] is False and out["started"] is False
     assert "instalacao-do-engine-local" in out["msg"]
     assert "baixa" not in out["msg"]              # nao promete baixar nada
@@ -6391,51 +6470,51 @@ def test_start_without_the_binary_points_at_the_other_plan(monkeypatch):
 
 def test_start_spawns_detached_and_never_holds_the_child(monkeypatch):
     opened = []
-    monkeypatch.setattr(localmodels, "find_binary", lambda: "C:/ollama.exe")
-    monkeypatch.setattr(localmodels, "status",
+    monkeypatch.setattr(engineproc, "find_binary", lambda: "C:/ollama.exe")
+    monkeypatch.setattr(engineproc.localmodels, "status",
                         lambda base="": {"up": True, "base": "", "models": [],
                                          "error": ""})
-    monkeypatch.setattr(localmodels.subprocess, "Popen",
+    monkeypatch.setattr(engineproc.subprocess, "Popen",
                         lambda argv, **kw: opened.append(kw) or object())
-    out = localmodels.start()
+    out = engineproc.start()
     assert out["started"] is True and out["up"] is True
-    assert opened[0]["stdout"] is localmodels.subprocess.DEVNULL
-    assert opened[0]["stderr"] is localmodels.subprocess.DEVNULL
-    if localmodels.os.name == "nt":
-        assert opened[0]["creationflags"] & localmodels.DETACHED_PROCESS
+    assert opened[0]["stdout"] is engineproc.subprocess.DEVNULL
+    assert opened[0]["stderr"] is engineproc.subprocess.DEVNULL
+    if engineproc.os.name == "nt":
+        assert opened[0]["creationflags"] & engineproc.DETACHED_PROCESS
     # o objeto Popen nao e guardado em lugar nenhum: sem handle nao ha como
     # "manter vivo" nem "derrubar junto com a janela".
-    assert not [n for n in vars(localmodels) if n.startswith("_child")]
+    assert not [n for n in vars(engineproc) if n.startswith("_child")]
 
 
 def test_restart_kills_the_port_owner_then_starts(monkeypatch):
     killed = []
-    monkeypatch.setattr(localmodels, "_pid_on_port", lambda port: 4321)
-    monkeypatch.setattr(localmodels.subprocess, "run",
+    monkeypatch.setattr(engineproc, "_pid_on_port", lambda port: 4321)
+    monkeypatch.setattr(engineproc.subprocess, "run",
                         lambda argv, **kw: killed.append(argv))
-    monkeypatch.setattr(localmodels, "status",
+    monkeypatch.setattr(engineproc.localmodels, "status",
                         lambda base="": {"up": True,
                                          "base": "http://127.0.0.1:11434",
                                          "models": [], "error": ""})
-    monkeypatch.setattr(localmodels, "start",
+    monkeypatch.setattr(engineproc, "start",
                         lambda wait=0: {"ok": True, "up": True, "started": True,
                                         "pending": False, "msg": "subiu"})
-    out = localmodels.restart()
+    out = engineproc.restart()
     assert killed[0][:3] == ["taskkill", "/PID", "4321"]
     assert out["restarted"] is True and out["stopped"] is True
     assert "PID 4321" in out["msg"]
 
 
 def test_pid_on_port_is_zero_when_nothing_listens(monkeypatch):
-    monkeypatch.setattr(localmodels.os, "name", "posix")
-    assert localmodels._pid_on_port(11434) == 0   # nada de fake no caminho
+    monkeypatch.setattr(engineproc.os, "name", "posix")
+    assert engineproc._pid_on_port(11434) == 0    # nada de fake no caminho
 ```
 
 Testes (**+4 em `tests/test_bridge.py`**):
 
 ```python
 def test_engine_start_routes_and_returns_both_shapes(state, monkeypatch):
-    monkeypatch.setattr(bridge.localmodels, "start",
+    monkeypatch.setattr(bridge.engineproc, "start",
                         lambda: {"ok": True, "up": True, "started": True,
                                  "pending": False, "msg": "no ar"})
     monkeypatch.setattr(bridge.localmodels, "status",
@@ -6454,14 +6533,13 @@ def test_the_engine_and_config_flags_do_not_leak_into_allowed_flags(state): ...
 
 > Corpos dos três `...` (mesma regra do Step 4C — escrever contra o bloco final):
 > o primeiro afirma `result["engine"]["restarted"] is True` com
-> `localmodels.restart` monkeypatchado; o segundo,
+> `engineproc.restart` monkeypatchado; o segundo,
 > `assert "engine-start" in bridge.COMMANDS and "engine-restart" in bridge.COMMANDS`;
 > o terceiro, que `--config`, `--get` e `--list` **não** estão em
 > `ALLOWED_FLAGS` — a janela edita tetos por `limits-get`/`limits-set` (Step 4E),
 > nunca por linha de comando (decisão 4 do dono).
 
-- [ ] **Step 4E: tetos por tipo de modelo na ponte — `limits-get` / `limits-set`
-  (decisão 4 do dono)**
+- [ ] **Step 4E: tetos por tipo de modelo na ponte — `limits-get` / `limits-set` (decisão 4)**
 
 A chave e os defaults nascem na **Task 6b** (`presets.default_limits()`,
 `config.default_config()["limits"]`). Aqui entra o lado da ponte, com a regra que
@@ -6592,9 +6670,12 @@ que **estes passos tocam**, para o executor saber onde parar:
 - `_handle_models`: perde o ramo `models-pull`, ganha os dois `engine-*`, extrai
   `_ollama_base(cfg)`.
 - `_handle_config`: três linhas de validação de `limits` no `config-set`.
-- módulos de motor: `localmodels.py` ganha `find_binary`/`start`/`_pid_on_port`/
-  `restart`, os imports `os/shutil/subprocess/time`, e `pull(..., stop, watch)`;
-  `settings.py` ganha `OLLAMA_START_WAIT`.
+- módulos de motor: **`src/thero/engineproc.py` é arquivo novo** (`find_binary`,
+  `start`, `_pid_on_port`, `restart` — a razão de não morarem em `localmodels.py`
+  está na COLISÃO DECLARADA do Step 4D: o outro plano crava que `localmodels.py`
+  é o cliente HTTP e não ganha gestão de processo); `localmodels.py` ganha só
+  `pull(..., stop, watch)` e os eventos de progresso; `settings.py` ganha
+  `OLLAMA_START_WAIT`.
 - `COMMANDS` passa a trazer, na família models (literal):
 
 ```python
@@ -6611,22 +6692,23 @@ que **estes passos tocam**, para o executor saber onde parar:
 **Contagem reliquada desta task** (a cadeia acumulada, medida, não deduzida):
 
 ```bash
-grep -c "^def test" tests/test_bridge.py tests/test_localmodels.py
+grep -c "^def test" tests/test_bridge.py tests/test_localmodels.py tests/test_engineproc.py
 python -m pytest tests/ -q
 ```
 
 | Arquivo | Antes | Delta prescrito | Depois |
 |---|---|---|---|
 | `tests/test_bridge.py` | 30 (Step 1) | −1 (`test_models_pull_streams`) +9 (4C) +4 (4D) +6 (4E) | **48** |
-| `tests/test_localmodels.py` | 20 (medido hoje: `grep -c "^def test"` = 20) | +3 (4B) +2 (4C) +5 (4D) | **30** |
-| Suíte inteira | 437 (fim da Task 7) | +48 +11 novos | **496** |
+| `tests/test_localmodels.py` | 20 (medido hoje: `grep -c "^def test"` = 20) | +3 (4B) +2 (4C) | **25** |
+| `tests/test_engineproc.py` | não existe | +5 (4D), arquivo novo | **5** |
+| Suíte inteira | 437 (fim da Task 7) | +48 +5 +5 | **495** |
 
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `437 + 48 + 11 = 496 passed` — conferindo os 48 e os 11 com o `grep -c`
+Expected: `437 + 48 + 5 + 5 = 495 passed` — conferindo os 48/5/5 com o `grep -c`
 da tabela acima; se a auditoria tiver removido testes deste bloco ao corrigir os
-chamadores, a base continua 437 e só o segundo termo muda (reportar o número
+chamadores, a base continua 437 e só os termos seguintes mudam (reportar o número
 final no commit, não reescrever esta linha).
 
 - [ ] **Step 6: Smoke manual do protocolo (sem UI)**
@@ -6647,7 +6729,7 @@ passar (é o lock de escrita do Step 4C fazendo o trabalho dele).
 - [ ] **Step 7: Commit (pedir confirmação)**
 
 ```bash
-git add src/thero/bridge.py src/thero/cli.py src/thero/localmodels.py src/thero/settings.py tests/test_bridge.py tests/test_localmodels.py
+git add src/thero/bridge.py src/thero/cli.py src/thero/engineproc.py src/thero/localmodels.py src/thero/settings.py tests/test_bridge.py tests/test_localmodels.py tests/test_engineproc.py
 git commit -m "feat(bridge): JSON request bridge with streaming, plus the --serve entry"
 ```
 
@@ -7100,6 +7182,66 @@ $webView.add_CoreWebView2InitializationCompleted({
 > Ao executar: confirme o `-Depth` do `ConvertTo-Json` do pedido (8 cobre
 > `--plan` com espaços) e rode o Step 4 antes de abrir a janela.
 
+- [ ] **Step 2B: o host com a baixa assíncrona (decisões 1 e 2 do dono)**
+
+O `Invoke-Engine` do Step 1 devolve **a primeira** mensagem que não é
+`{"event":"line"}`. Com o worker da Task 8 Step 4C isso não basta mais: um
+`models-pull` produz **três** coisas no mesmo `id` — o `accepted` imediato, as
+linhas/progresso enquanto a baixa corre, e a resposta `final` depois — e a
+resposta final de um pull pode chegar quando o host já está esperando **outro**
+pedido. Além disso, o `engine-line` de hoje repassa **só o texto**
+(`@{ id = $reqId; text = ... }`), e os campos numéricos do progresso
+(`pct/completed/total/digest`, Task 8 Step 4B/4C) morrem no host — a barra nunca
+teria o que pintar.
+
+Três edits dentro de `Invoke-Engine`, nenhuma outra função tocada:
+
+```powershell
+        if ($parsed.event -eq 'line') {
+            # Task 8 Step 4B: a linha do pull traz pct/completed/total/digest.
+            # Repassar SO o texto e o mesmo erro de jogar o payload no chao.
+            Send-ToJs -Type 'engine-line' -Payload @{
+                id        = $reqId
+                text      = [string]$parsed.text
+                pct       = $parsed.pct
+                completed = $parsed.completed
+                total     = $parsed.total
+                digest    = [string]$parsed.digest
+            }
+            [void][System.Windows.Forms.Application]::DoEvents()
+            continue
+        }
+        # Resposta de OUTRO pedido (o `final` de um pull que ja foi devolvido
+        # como aceito): encaminha e segue esperando o meu. Sem este ramo o host
+        # devolveria o envelope errado e a barra ficaria eternamente andando.
+        if ($parsed.id -ne $reqId) {
+            Send-ToJs -Type 'engine-reply' -Payload $parsed
+            [void][System.Windows.Forms.Application]::DoEvents()
+            continue
+        }
+        # O `accepted` do models-pull fecha o pedido no sentido do JS (a barra
+        # comeca) mas a resposta real ainda vem: repassa e continua lendo.
+        if ($parsed.result -and $parsed.result.accepted) {
+            Send-ToJs -Type 'engine-reply' -Payload $parsed
+            [void][System.Windows.Forms.Application]::DoEvents()
+            continue
+        }
+        return $parsed
+```
+
+E o `DoEvents()` passa a rodar em **toda** iteração do laço (não só na linha),
+porque o `ReadLine()` é bloqueante e a janela continua congelada entre eventos —
+é a limitação que o próprio bloco do Step 1 já documenta; com o worker ela fica
+mais visível, não pior.
+
+**Cancelar:** o `engine-cancel` deste arquivo **derruba o motor Python inteiro**
+(`Stop-Engine` + `taskkill /T`) e é isso que o botão "Cancelar" deve chamar
+durante um `run`/`npx`. Durante um **pull** o botão chama o comando da ponte
+`models-pull-cancel` (um `engine-request` normal; Task 10 Step 6B decide qual dos
+dois) — matar o motor jogaria fora a lista de modelos e a própria baixa que o
+daemon pode estar terminando sozinho. Não apagar `engine-cancel`: ele é o único
+caminho com filho de verdade.
+
 - [ ] **Step 3: `gui/dev.cmd` (rodar sem compilar)**
 
 ```bat
@@ -7126,6 +7268,16 @@ Write-Host "TheroHost.ps1: 0 erros de sintaxe, $($tokens.Count) tokens"
 ```
 Expected: `TheroHost.ps1: 0 erros de sintaxe, ... tokens`. A janela em si só é
 exercitada no smoke da Task 11, com motor de verdade.
+
+Checar o Step 2B sem abrir a janela (o parser aceita o arquivo mesmo com o ramo
+assíncrono faltando — sintaxe não é semântica):
+
+```bash
+grep -c "parsed.result.accepted\|parsed.pct\|-ne \$reqId" gui/TheroHost.ps1
+```
+Expected: `3` (um por branch novo; zero = o Step 2B não foi aplicado). **Contagem
+de testes Python desta task: inalterada em 496** — Task 9 não escreve Python; a
+verificação dela é o parser do PowerShell acima.
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -7931,6 +8083,249 @@ Trocar por:
   });
 ```
 
+- [ ] **Step 6B: a baixa na barra que JÁ EXISTE (decisões 1 e 2, lado da janela)**
+
+> **Correção de ponteiro, para não caçar fantasma:** a barra de progresso é
+> `gui/app.js:458` — `<div class="progress"><div class="bar"><div class="bar-fill"
+> id="rbar">` — com a meta `#rstep`/`#rpct` ao lado, e o pintor dela já existe
+> dentro de `openRun` (`gui/app.js:464-477`: `bar.style.transform =
+> "scaleX(pct/100)"; pct.textContent = pct + "%"`). A referência `.term .bar > i`
+> que circula nas notas de costura **não é a barra**: são as três luzinhas do
+> `term-bar`. Nada de criar componente novo: o dono quer o painel de execução que
+> a interface aprovada já tem.
+
+Três edits, todos dentro do que os Steps 3 e 5 já prescreveram:
+
+1. Em `onHostMessage` (Step 1), o `engine-line` entrega o **payload inteiro** —
+   sem isso o `pct` morre no host (Task 9 Step 2B) ou morre aqui:
+
+```javascript
+    if (msg.type === 'engine-line') {
+      const entry = Host.pending.get(payload.id);
+      if (entry && entry.onLine) entry.onLine(payload);   // text + pct + bytes
+      return;
+    }
+```
+
+> Os chamadores de `onLine` do Step 3 (`Bridge.run`, `skills-install` e os
+> `Host.send` de skills) recebem hoje um **string**. Trocar o contrato sem trocar
+> eles é exatamente a costura quebrada que a auditoria caça: cada um deles ganha
+> `const text = typeof p === 'string' ? p : String(p.text || '')` na primeira
+> linha. O `run` de terminal **não** passa a mostrar percentual algum (decisão 2:
+> "no terminal nao precisa") — ele só sobrevive à mudança de tipo.
+
+2. `Bridge.modelsPull` substituído (ele era o `... (t) => onLine({type: classify(t), text: t, pct: 0})`
+   do Step 3), porque agora há `accepted` + `final` no mesmo `id`:
+
+```javascript
+    modelsPull(name, onLine, onDone) {
+      if (state.phase !== 'engine') { return onDone(true); }
+      Host.send('models-pull', { name: name },
+        (r) => {
+          // Dois envelopes, mesmo id: o aceito (a barra comeca) e o final.
+          if (r.ok && r.result && r.result.accepted) { state.pullId = r.id; return; }
+          state.pullId = null;
+          const res = (r && r.result) || {};
+          if (r.ok && res.cancelled) {
+            onLine({ type: "warn", pct: null, text: (res.msg || 'baixa cancelada') +
+              " Se ela continuar no Ollama, o unico jeito de para-la e Reiniciar o motor." });
+          }
+          const ok = !!(r.ok && res.exitCode === 0 && !res.cancelled);
+          if (ok) loadModels(render);
+          onDone(ok);
+        },
+        (p) => {
+          const text = String((p && p.text) || '');
+          if (p == null || p.pct == null) {
+            onLine({ type: classify(text), text: text, pct: null }); return;
+          }
+          onLine({ type: "act", pct: Number(p.pct),
+                   text: text + "  ·  " + gauge(p) });
+        });
+    },
+```
+
+3. O medidor, ao lado de `classify` (Step 4). O Ollama só manda bytes **da camada
+   em voo**, então MB/total e velocidade são derivados aqui, e voltam a zero
+   quando o `digest` muda (fase nova, camada nova — a barra é por fase, e o
+   `#rstep` diz em qual):
+
+```javascript
+  // O Ollama nao manda velocidade nem total cumulativo: a janela deriva dos
+  // deltas entre eventos do MESMO digest. Sem digest novo, sem pressa.
+  const gaugeState = { digest: "", at: 0, bytes: 0 };
+  function gauge(p) {
+    const now = Date.now(), mb = 1048576;
+    let speed = "";
+    if (gaugeState.digest === p.digest && gaugeState.at && now > gaugeState.at) {
+      const d = (p.completed - gaugeState.bytes) / ((now - gaugeState.at) / 1000);
+      if (d > 0) speed = " · " + (d / mb).toFixed(1) + " MB/s";
+    }
+    gaugeState.digest = p.digest; gaugeState.at = now; gaugeState.bytes = p.completed;
+    return (p.completed / mb).toFixed(0) + " / " + (p.total / mb).toFixed(0) + " MB" + speed;
+  }
+```
+
+E o botão "Cancelar" do `openRun` (Step 5) deixa de ser um tamanho único:
+
+```javascript
+      cancel.addEventListener("click", () => {
+        if (state.pullId != null) {          // BAIXA: um pedido na ponte, nao kill do motor
+          Host.send('models-pull-cancel', {}, (r) => {
+            state.pullId = null;
+            const res = (r && r.result) || {};
+            paint({ type: res.cancelled ? "warn" : "muted", pct: null,
+                    text: res.msg || "nenhuma baixa em andamento" });
+            if (res.cancelled) loadModels(render);   // a lista e a verdade final
+          }, null);
+          return;
+        }
+        Host.cancel(state.runId);            // run/npx: derruba a arvore (Task 9)
+      });
+```
+
+- [ ] **Step 6C: "Iniciar"/"Reiniciar" o motor local na tela (decisão 3)**
+
+O retrato do Ollama já chega por `models-status` (`adoptModels`, Step 2). Guardar
+o `up` e desenhar os botões; **nenhum outro caminho chama start/restart** — nem
+`hydrate()`, nem `refreshFromEngine()`, nem a troca de escopo:
+
+```javascript
+  // em adoptModels (Step 2), no fim da funcao:
+    M.ollamaUp = !!o.up;
+    M.ollamaMsg = o.error || "";
+```
+
+```javascript
+    engineStart(cb) {
+      if (state.phase !== 'engine') { return cb({ ok: false, mock: true }); }
+      Host.send('engine-start', {}, (r) => {
+        if (r.ok) adoptModels(r.result.ollama, state.routing);
+        cb(r);
+      }, null);
+    },
+    engineRestart(cb) {
+      if (state.phase !== 'engine') { return cb({ ok: false, mock: true }); }
+      Host.send('engine-restart', {}, (r) => {
+        if (r.ok) adoptModels(r.result.ollama, state.routing);
+        cb(r);
+      }, null);
+    },
+```
+
+No template de `sec.models` (linha 308 do `gui/app.js` atual, ao lado do
+`#md-scan`), um botão por estado — e **sem botão "Instalar"**, que pertence ao
+plano `2026-09-28-instalacao-do-engine-local.md`:
+
+```javascript
+        ${!M.ollamaUp ? `<button class="btn btn-ghost" id="en-start">${IC.play} Iniciar Ollama</button>` : ""}
+        ${M.ollamaUp ? `<button class="btn btn-ghost" id="en-restart">${IC.refresh} Reiniciar</button>` : ""}
+```
+
+Em `wire()` da mesma seção:
+
+```javascript
+    const enStart = c.querySelector("#en-start");
+    if (enStart) enStart.addEventListener("click", () => {
+      Bridge.engineStart((r) => {
+        const eng = (r && r.result && r.result.engine) || {};
+        render();
+        openRun("iniciar o Ollama", cfg("ollama.start"),
+          resultLines(r, eng.pending ? "Ollama subindo — reabra a tela em instantes"
+                                     : (eng.msg || "Ollama no ar")));
+      });
+    });
+    const enRestart = c.querySelector("#en-restart");
+    if (enRestart) enRestart.addEventListener("click", () => {
+      // Unico gatilho, e com aviso antes de tocar no motor que NAO hospedamos.
+      if (!window.confirm("Reiniciar o Ollama derruba qualquer baixa em andamento. Continuar?")) return;
+      Bridge.engineRestart((r) => {
+        const eng = (r && r.result && r.result.engine) || {};
+        render();
+        openRun("reiniciar o Ollama", cfg("ollama.restart"),
+          resultLines(r, eng.msg || "reiniciado"));
+      });
+    });
+```
+
+Regras que o executor não pode perder: iniciar **quando estiver caído** é o ramo
+`!M.ollamaUp` (e pode ser disparado pelo clique em "Baixar"/"Reescanear" com o
+motor fora — nesse caso o handler chama `Bridge.engineStart` antes do
+`models-pull`, e o `pending` vira uma linha no painel, nunca um retry em loop);
+**reiniciar** só pelos cliques acima; nada aqui mantém o motor vivo, e fechar a
+janela não derruba o Ollama (é o `Stop-Engine` do host que derruba o **Python**).
+
+- [ ] **Step 6D: os tetos por tipo de modelo na tela (decisão 4)**
+
+Um bloco na tela **Modelos locais** (não uma seção nova na barra lateral — a
+interface aprovada tem nove telas e acrescentar uma é decisão de design, não
+desta task). Mesma chave do terminal, mesma fonte:
+
+```javascript
+    limitsGet(cb) {
+      if (state.phase !== 'engine') { return cb(null); }
+      Host.send('limits-get', {}, (r) => {
+        if (r.ok) { state.limits = r.result.limits; state.limitDefaults = r.result.defaults; }
+        cb(r.ok ? r.result : null);
+      }, null);
+    },
+    limitsSet(limits, cb) {
+      if (state.phase !== 'engine') { return cb({ ok: true, mock: true }); }
+      Host.send('limits-set', { limits: limits }, (r) => {
+        if (r.ok) state.limits = r.result.limits;
+        cb(r);
+      }, null);
+    },
+```
+
+No template de `sec.models`, depois do bloco de roteamento:
+
+```javascript
+        <div class="block"><div class="block-top"><b>Chamadas simultâneas por tipo de modelo</b><small>limite que o Zeus observa ao disparar o plano aprovado</small></div>
+          ${["local","standard","premium"].map((k) => `
+            <div class="row"><label for="lm-${k}">${k}</label>
+            <input class="input mono" id="lm-${k}" type="number" min="1" max="64" value="${state.limits[k]}">
+            <span class="hint">recomendado ${state.limitDefaults[k]}</span></div>`).join("")}
+        </div>
+```
+
+Em `wire()`:
+
+```javascript
+    ["local", "standard", "premium"].forEach((k) => {
+      bind(c, "lm-" + k, "change", (v) => {
+        const n = parseInt(v, 10);
+        if (!(n >= 1 && n <= 64)) { render(); return; }   // o motor recusaria igual
+        const patch = {}; patch[k] = n;
+        Bridge.limitsSet(patch, (r) => {
+          openRun("gravar teto " + k, cfg("limits." + k),
+            resultLines(r, "limits." + k + " = " + n));
+        });
+      });
+    });
+```
+
+E nos dois fluxos de re-leitura (Steps 2): `hydrate()` chama `loadModels(...)` e
+passa a chamar `Bridge.limitsGet(null)` **antes do `render()` final**, e
+`refreshFromEngine()` idem — é o que faz um `thero --config limits.local=6`
+digitado no terminal aparecer na janela aberta, que é a regra "mesma fonte, sem
+cache" do dono. No `state` (Step 8), os campos novos:
+
+```javascript
+    pullId: null,
+    limits: { local: 4, standard: 3, premium: 2 },
+    limitDefaults: { local: 4, standard: 3, premium: 2 },  // o limits-get sobrescreve
+```
+
+> **Nota de design (fora do escopo deste passo, declarada de propósito):** o
+> bloco acima fixa **chaves, defaults, validação e fluxos**. A aparência — rótulo,
+> ordem, o "recomendado" ao lado do número, e o peso de convencer o usuário de que
+> o default já cobre — é tela nova e passa pelo `impeccable` (regra do projeto:
+> obrigatório para UI) antes do commit. Quem executar a Task 10 **invoca o
+> `impeccable`** para este Step 6D e para o Step 6B, e não "arredonda" o layout por
+> conta própria. E o `type="number"` com `min/max` é a única validação de cliente:
+> a decisão é do motor, nunca do JS.
+
 - [ ] **Step 7: Barra de título, rodapé e escopo passam pelo host**
 
 Trocar as três linhas que hoje são simuladas (linhas 735-736) e o toggle de
@@ -8085,10 +8480,100 @@ def test_the_bridge_command_list_matches_the_ui_vocabulary():
     assert not missing, "comandos usados pela UI e ausentes da whitelist: %s" % sorted(missing)
 ```
 
+- [ ] **Step 1B: os testes estáticos que as quatro decisões do dono exigem**
+
+Acrescentar ao **mesmo** `tests/test_gui_static.py` do Step 1 (nada do Step 1
+muda; o `SRC` abaixo é só para não repetir o caminho):
+
+```python
+SRC = Path(__file__).resolve().parent.parent / "src" / "thero"
+
+
+def read_src(name):
+    return (SRC / name).read_text(encoding="utf-8")
+
+
+def _body(js, name):
+    """Corpo de `function <name>` ate a proxima `function` no mesmo nivel.
+    Se o app.js final definir isso de outro jeito (const seta), ajustar AQUI e
+    nada mais -- o contrato e 'nenhum caminho de re-leitura chama engine-*'."""
+    start = js.index("function " + name)
+    nxt = js.find("\n  function ", start + 1)
+    return js[start:nxt if nxt != -1 else len(js)]
+
+
+def test_the_pull_progress_uses_the_bar_the_panel_already_has():
+    # Decisao 2: barra visual NA interface, reaproveitando a do painel de
+    # execucao. Uma segunda barra na tela e o defeito, nao o recurso.
+    js = read("app.js")
+    assert 'id="rbar"' in js
+    assert js.count('class="bar"') == 1
+    assert "gauge(" in js and "models-pull" in js
+
+
+def test_a_pull_is_cancelled_through_the_bridge_not_by_killing_the_engine():
+    # Decisao 1 + 3: matar o motor Python no meio de uma baixa jogaria fora a
+    # lista de modelos e o proprio pedido de cancelamento.
+    js, ps = read("app.js"), read("TheroHost.ps1")
+    assert "Host.send('models-pull-cancel'" in js
+    assert "state.pullId" in js
+    assert "'engine-cancel'" in ps          # continua, para o caminho do run
+
+
+def test_the_engine_start_trigger_is_explicit_and_the_restart_is_not_automatic():
+    # Decisao 3: nos nao hospedamos o motor. Nenhum caminho de re-leitura, nem
+    # o arranque, pode chamar start/restart -- so clique.
+    js = read("app.js")
+    assert "engine-start" in js and "engine-restart" in js
+    for name in ("hydrate", "refreshFromEngine"):
+        assert "engine-start" not in _body(js, name), name
+        assert "engine-restart" not in _body(js, name), name
+    assert js.count("Host.send('engine-restart'") == 1
+    assert "window.confirm" in js            # reiniciar avisa antes de tocar
+
+
+def test_the_limits_vocabulary_is_one_set_in_three_places():
+    # Decisao 4: chave unica, uma definicao de defaults, dois caminhos que
+    # escrevem nela. Se algum dos tres inventar um quarto tipo, isto quebra.
+    from thero import presets
+    js, cli, bridge = read("app.js"), read_src("cli.py"), read_src("bridge.py")
+    for key in presets.LIMITS:
+        assert key in js and key in cli and key in bridge, key
+    assert presets.default_limits() == {"local": 4, "standard": 3, "premium": 2}
+    assert "--config" in cli and "--get" in cli and "--list" in cli
+    # as tres flags da decisao 4 NAO sao caminho da ponte (ver Task 8 Step 4D)
+    assert "--config" not in bridge.split("ALLOWED_FLAGS")[1]
+
+
+def test_no_ollama_binary_or_download_lives_with_the_interface():
+    # Decisao 3: o binario e do usuario (plano de instalacao e de outro
+    # trabalho). A janela nem sabe baixar.
+    offenders = [p.name for p in GUI.rglob("*") if "ollama" in p.name.lower()]
+    assert offenders == []
+    js, ps = read("app.js"), read("TheroHost.ps1")
+    for forbidden in ("Invoke-WebRequest", "Start-BitsTransfer", "curl.exe"):
+        assert forbidden not in ps, forbidden
+        assert forbidden not in js, forbidden
+
+
+def test_the_bridge_has_exactly_one_thread_and_it_is_the_pull_worker():
+    # Decisao 1: worker SO no caminho de baixa. Um segundo Thread() aqui seria
+    # o thread pool no serve() que o dono vetou.
+    bridge = read_src("bridge.py")
+    assert bridge.count("threading.Thread(") == 1
+    assert "class PullWorker" in bridge
+    # decisao 3, mesma ideia do outro lado: start/restart tem um unico chamador.
+    assert bridge.count("engineproc.start(") == 1
+    assert bridge.count("engineproc.restart(") == 1
+    assert "OLLAMA_START_WAIT" not in bridge    # o teto mora no localmodels
+```
+
 - [ ] **Step 2: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `386 + 7 = 393 passed`
+Expected: `495 + 13 = 508 passed` (7 do Step 1 + 6 deste passo — conferir com
+`grep -c "^def test" tests/test_gui_static.py` → `13`; a base 495 é a medida no
+fim da Task 8, e as Tasks 9 e 10 não escrevem Python).
 
 - [ ] **Step 3: Smoke manual da janela**
 
@@ -8117,6 +8602,37 @@ Checklist (executar e marcar no PR):
 - [ ] Abrir de novo: `firstRun` já é false e o onboarding não aparece.
 - [ ] Fechar a janela derruba o `python thero.py --serve` (nenhum processo
       órfão em `Get-Process python`).
+
+Itens das quatro decisões do dono (2026-09-28) — executá-los nesta janela, com o
+Ollama instalado na máquina (sem ele, marcar os três primeiros como
+"não executável aqui" e reportar; **não** marcar como passado):
+
+- [ ] **Baixa com barra:** "Baixar" um modelo pequeno (`qwen2.5:1.5b`) → o painel
+      abre **na hora** com a barra em 0%, a barra anda com o percentual do
+      Ollama, o `#rstep` mostra a fase, e a linha traz `N / M MB · X MB/s`.
+      Nenhum outro clique da janela trava enquanto a baixa corre (provar:
+      alternar de tela e clicar "Reescanear" — responde).
+- [ ] **Baixa dupla:** com uma baixa rodando, clicar em outro "Baixar" → o painel
+      mostra `ja existe uma baixa em andamento (<modelo>)`, e o segundo `pull`
+      nunca chega ao Ollama (`curl -s http://127.0.0.1:11434/api/ps` confirma).
+- [ ] **Cancelar de verdade:** Cancelar durante a baixa → painel fecha, nenhum
+      `python` órfão, **e o Ollama continua de pé** (a janela ainda responde
+      `models-status` sem reiniciar nada). Medir se o download prossegue no
+      daemon (Task 8 Step 4C) e registrar a medição no commit.
+- [ ] **Motor ausente:** com o Ollama caído, a tela Modelos mostra "Iniciar
+      Ollama"; clicar → `started`/`pending` legíveis e a lista aparece na
+      reabertura. **Fechar o Thero não derruba o Ollama** (conferir
+      `Get-Process ollama*` depois de fechar a janela — é a regra "não somos o
+      serviço que hospeda o motor").
+- [ ] **Reiniciar só por clique:** o botão "Reiniciar" pede confirmação, e nenhuma
+      ação de tela (hidratar, trocar escopo, reescanear) o dispara sozinho.
+- [ ] **Tetos nos dois caminhos:** `thero --config limits.local=6` com a janela
+      aberta → a tela Modelos locais mostra `6` ao reescanear/abrir (sem
+      reabrir o app); editar na tela → `thero --config --get limits.local` mostra
+      o mesmo número. `thero --config --list` mostra `limits.local`,
+      `limits.premium`, `limits.standard` com os defaults `4/2/3` numa máquina
+      limpa. Recusa: `thero --config limits.local=muitos` sai com código 2 e não
+      grava nada.
 
 - [ ] **Step 4: Commit (pedir confirmação)**
 
@@ -8527,6 +9043,12 @@ ls -la dist/
 Expected: `dist/Thero.exe` (payload de `src/` + `thero.py` + `gui/` embutido) e
 nenhum `Thero.win32.exe`/`.tmp.ps1` solto na raiz.
 
+Antes do commit, `python -m pytest tests/ -q` → **508 passed**: esta task não
+escreve Python (os itens novos de verificação acima são manuais, marcados no
+PR), então a contagem da cadeia termina aqui, medida em cada task:
+**416** (baseline, Tasks 0-6) → **431** (6b) → **437** (7) → **495** (8) →
+**495** (9, PowerShell) → **495** (10, `app.js`) → **508** (11).
+
 - [ ] **Step 6: Testar de fora do repositório (é esse o ponto do portable)**
 
 ```bash
@@ -8539,6 +9061,20 @@ Rodar `C:\temp\thero-test\Thero.exe` e conferir:
 - [ ] A barra de título mostra "motor", não "mock" (Python do sistema existe
       nesta máquina).
 - [ ] Fechar o exe derruba o `python --serve`.
+- [ ] **Nenhum binário de motor no payload** (decisão 3: o Ollama é do usuário):
+      `python -c "import re,io,pathlib; t=pathlib.Path('.build/payload.ps1').read_text(encoding='utf-8'); print(len(re.findall(r'ollama', t, re.I)))"`
+      → `0`; e `git ls-files gui | grep -i ollama` → vazio. O `python --serve` que
+      cai com a janela **não** é o Ollama: conferir que `Get-Process ollama*`
+      sobreviva ao fechar do `Thero.exe` é o teste desta regra.
+- [ ] **`--config` funciona no portable, na MESMA fonte:** rodar
+      `python "$env:LOCALAPPDATA\\Thero\\app\\<versao>\\thero.py" --config
+      limits.local=5`, abrir o `Thero.exe` e ver `5` na tela Modelos locais;
+      editar para `3` na tela e rodar `--config --get limits.local` → `3`. Nada
+      de `limits` dentro de `%LOCALAPPDATA%\Thero\app\` (o payload é só código: a
+      chave vive em `~/.thero/config.json`, um arquivo, dois caminhos).
+- [ ] **A baixa com barra funciona pelo exe** (não só do repositório): baixar um
+      modelo pequeno e ver o percentual subir, o `N / M MB · X MB/s` na linha, e o
+      Cancelar fechar o painel sem derrubar o `Thero.exe` nem o Ollama.
 
 - [ ] **Step 7: Commit (pedir confirmação)**
 
@@ -8565,6 +9101,10 @@ git commit -m "build: package the desktop interface as a single portable Thero.e
 | Auditoria/Athena/Zeus fora do Thero | não aparecem em nenhuma tarefa |
 | Interface desktop real (padrão Vector/Gênesis) | 9 + 10 + 11 |
 | Portable, sem instalador | 12 |
+| **Baixas longas sem congelar a janela + cancelar (dono, 2026-09-28)** | 8 (Steps 4B/4C) + 9 (Step 2B) + 10 (Step 6B) + 11 (Step 1B/3) |
+| **Progresso visual na interface, não no terminal (dono, 2026-09-28)** | 8 (Step 4B: `completed/total` do NDJSON) + 10 (Step 6B: `#rbar` que já existe) |
+| **Motor local: checar / iniciar / reiniciar sob demanda (dono, 2026-09-28)** | 8 (Step 4D: `engine-start`/`engine-restart`) + 10 (Step 6C) + 11 (Step 1B: gatilho só por clique) — **instalar é de outro plano** |
+| **Teto por tipo de modelo, configurável na interface e no terminal (dono, 2026-09-28)** | **6b** (chave + `--config`) + 8 (Step 4E) + 10 (Step 6D) + 11/12 (verificação) |
 
 ## Fora deste plano (declarado, não esquecido)
 
@@ -8574,3 +9114,24 @@ git commit -m "build: package the desktop interface as a single portable Thero.e
 - Onboarding de primeira abertura nos outros apps do Theroverse.
 - `npx skills search` de comunidade: sem verificação nesta máquina, então não
   implementei (ver Task 6).
+- **Instalar / baixar o Ollama (binário, tamanho, aviso de tamanho + um clique,
+  verificar SHA quando existir): dono é
+  `docs/superpowers/plans/2026-09-28-instalacao-do-engine-local.md`**, de outro
+  trabalho — ele **existe** na árvore (não-rastreado nesta branch, Tasks 1-15,
+  módulos `enginedata/artifactcheck/download/engineinstall/localep`), e a frase 22
+  dele é **mais rígida** que a decisão 3 do dono (ver Task 8 Step 4D, "COLISÃO
+  DECLARADA"). Este
+  plano só declara a dependência e oferece os botões de **ciclo de vida sob
+  demanda** (checar/iniciar/reiniciar). Numa máquina onde o motor já existe, o
+  instalar alheio tem de **perguntar antes**, nunca passar por cima.
+- **Respeitar o teto em tempo de execução** (`limits` aplicado a chamadas
+  concorrentes): é o Zeus quem dispara o paralelismo, no plano dele. Aqui vivem a
+  chave, os defaults, o `--config` e a tela. Nenhum código deste plano lê
+  `limits` para governar fila.
+- **Watchdog / manutenção do motor vivo**: vetado pela decisão 3 (não somos o
+  serviço que hospeda o Ollama). Nada de observador em background, nada de
+  "religar se cair".
+- **Aparidência das telas novas dos tetos e da barra** (rótulo, ordem, peso
+  visual do "recomendado", copy de onboarding): revisão `impeccable` na Task 10,
+  não decisão desta prescrição. O que está fixado aqui são chaves, defaults,
+  validação e fluxos.
