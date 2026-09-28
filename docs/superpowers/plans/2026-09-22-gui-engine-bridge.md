@@ -4295,6 +4295,462 @@ git commit -m "feat(skills): origin-aware skill state with quarantine-only unins
 
 ---
 
+### Task 6b: `--config` estilo git — a chave `limits` e a fonte única
+
+**Files:**
+- Modify: `src/thero/presets.py` (novos `LIMITS` + `default_limits()`, ao lado de `default_routing()` em `presets.py:237`)
+- Modify: `src/thero/config.py` (`limits` em `default_config()`; novos `get_dotted`, `set_dotted`, `iter_scalars`)
+- Modify: `src/thero/cli.py` (flags `--config`, `--get`, `--list` + despacho antes do banner + epílogo)
+- Test: `tests/test_config_limits.py` (**15** `def test_`)
+
+Palavra do dono hoje: *"gostaria de ter um local de configuracoes tanto na
+interface tanto no terminal semelhante ao git config, para definir, vindo suas
+recomendacoes por default, e definir um teto pra cada tipo de modelo"*. O teto
+é o paralelismo que o **Zeus** vai disparar depois de aprovar um plano — outro
+satélite, com outro plano (`2026-09-28-zeus-governador-de-modelos`). **O que é
+nosso**: a chave, os defaults, a CLI, a ponte e a tela. O Zeus consome depois;
+nenhuma tarefa daqui respeita teto em tempo de execução.
+
+Fatos verificados nesta máquina (não inventar nada além disso):
+
+| Fato | Onde foi visto |
+|---|---|
+| `~/.thero/config.json` já é a única fonte de config, lida com `utf-8-sig` e gravada de forma atômica (`.tmp` + `os.replace`), **sem BOM** | `src/thero/config.py:24-72` |
+| `default_config()` tem exatamente `version, providers, agents, routing, preferences`; `test_config.py:6-11` afirma chave a chave (não `==` do dict inteiro), então **acrescentar `limits` quebra zero testes** | lido hoje |
+| `BridgeState` **cacheia** o config (`self._cfg`; `load()` só lê disco na primeira vez) — janela aberta não vê o que o terminal gravou | bloco `BridgeState` da Task 8 |
+| a CLI é só flags (nenhum posicional), e `main()` despacha `--mcp` na primeira linha, antes do banner que imprime `===...` | `src/thero/cli.py:483-498` |
+| `--get` e `--list` **não existem** hoje (nenhuma colisão de nome): as 16 flags declaradas são `--skills-only --merge-only --audit --audit-only --install-command --local --index --max-files --plan --plan-context --check --update --mcp --publish --publish-agent --publish-out` | `grep -n '"--[a-z-]*"' src/thero/cli.py` |
+| `tests/test_cli.py::test_parse_args_defaults` (linhas 20-33) é uma **lista de asserções soltas** (`args.x is False`), não um `vars(args) == {...}`: acrescentar flags **não** o quebra, e ele não precisa ser tocado. O mesmo vale para `test_default_config_shape` (`tests/test_config.py:6-11`), que também não enumera as chaves de topo. | lido hoje, linha a linha |
+
+**Regras desta task (decisão 4 do dono):**
+
+1. Shape fechado: `"limits": {"local": <int>, "standard": <int>, "premium": <int>}`.
+   Defaults = recomendação dele, definida **uma única vez** em
+   `presets.default_limits()`, usada por `config`, pela CLI, pela ponte
+   (`limits-get`, Task 8 Step 4E) e pela tela (Task 10 Step 6D).
+2. `--config limits.local=4` escreve; `--config --get limits.local` imprime **só
+   o valor** (pipe-ável; exit 1 se a chave não existe); `--config --list` imprime
+   `chave=valor` ordenado, uma linha por folha escalar de `limits`, `routing` e
+   `preferences`. `providers`/`agents` **não** aparecem no `--list` e **não**
+   são escrevíveis por aqui: são estruturas com tela e comando próprios, e
+   `providers` é onde mora qualquer coisa parecida com credencial.
+3. Escrever sem cache: `--config` faz read-modify-write em `config.load`/
+   `config.save` (mesmo caminho dos outros capítulos; nenhuma gravação parcial
+   própria, nenhuma segunda cópia do config em outro arquivo).
+4. `--config`, `--get`, `--list` **NÃO entram em `bridge.ALLOWED_FLAGS`**. A
+   janela edita tetos por `limits-get`/`limits-set` (Task 8 Step 4E), que escrevem
+   na mesma fonte. Um `--config` pela ponte seria config por dois canais.
+5. `config.json` é arquivo **nosso** (Task 1) — a regra inegociável 6 (backup
+   antes de escrever arquivo de terceiro) não se aplica aqui.
+
+> **Costura em aberto (não fingir que existe).** Esta task referencia
+> `limits-get`/`limits-set` da **Task 8 Step 4E** e a tela do **Task 10 Step
+> 6D** — nenhum dos dois está escrito no plano ainda (o Step 4D do ciclo de
+> vida do Ollama e os Steps 6B/6C da Task 10 prometidos na tabela de cobertura
+> do Task 0 também faltavam; o 4D foi escrito depois, os outros continuam
+> pendentes). Quem executar a Task 8 deve escrever o Step 4E ANTES de tocar em
+> código — mesma fonte, com o cache do `BridgeState` contornado na leitura de
+> `limits`, porque a janela precisa ver o que o terminal gravou. Executar a
+> Task 6b isolada não deixa nada pendurado: a chave, os defaults e a CLI vivem
+> só em `presets.py`/`config.py`/`cli.py`.
+
+- [ ] **Step 1: Testes**
+
+`tests/test_config_limits.py`:
+
+```python
+import json
+from pathlib import Path
+
+import pytest
+
+from thero import config, presets
+from thero.cli import main, parse_args
+
+
+def set_argv(monkeypatch, *args):
+    monkeypatch.setattr("sys.argv", ["thero.py", *args])
+
+
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    """config_path() resolve USERPROFILE/HOME NA CHAMADA (config.py:24-30),
+    entao remapear as duas variaveis isola o store sem tocar no da maquina.
+    Retorna o caminho do config.json vazio (ainda nao existe)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    return tmp_path / ".thero" / "config.json"
+
+
+def cli(monkeypatch, *args):
+    # O entry path e irrelevante neste ramo: o despacho do --config vem antes
+    # de qualquer leitura de arquivo do instalador (cli.py:490-498).
+    set_argv(monkeypatch, *args)
+    main(Path("thero.py"))
+
+
+# ——— defaults ———
+
+def test_parse_args_has_the_three_config_flags(monkeypatch):
+    set_argv(monkeypatch)
+    args = parse_args()
+    assert args.config is None            # None != []: "ausente" vs "--config" solto
+    assert args.get is None
+    assert args.list is False
+
+
+def test_default_limits_are_the_owner_recommendation():
+    assert presets.default_limits() == {"local": 4, "standard": 3, "premium": 2}
+    assert presets.LIMITS == ("local", "standard", "premium")
+
+
+def test_default_config_carries_limits_next_to_routing():
+    cfg = config.default_config()
+    assert cfg["limits"] == presets.default_limits()
+    # Subconjunto, nao igualdade: o plano 2026-09-28-registro-de-equipe vai
+    # acrescentar a chave `team` no mesmo dict, e uma igualdade exata faria as
+    # duas tasks se canibalizarem por uma linha de teste.
+    assert {"version", "providers", "agents", "routing", "preferences",
+            "limits"} <= set(cfg)
+
+
+# ——— escrever ———
+
+def test_cli_config_set_writes_the_dotted_key(store, monkeypatch, capsys):
+    cli(monkeypatch, "--config", "limits.local=6")
+    assert "limits.local=6" in capsys.readouterr().out
+    assert config.load(store)["limits"]["local"] == 6
+
+
+def test_cli_config_write_keeps_the_other_sections(store, monkeypatch):
+    cfg = config.default_config()
+    cfg["providers"][0]["model"] = "opus"
+    config.save(cfg, path=store)
+    cli(monkeypatch, "--config", "limits.premium=1")
+    after = config.load(store)
+    assert after["limits"]["premium"] == 1
+    assert after["providers"][0]["model"] == "opus"      # read-modify-write
+
+
+def test_cli_and_the_bridge_read_the_same_bytes(store, monkeypatch, capsys):
+    # O outro caminho (a ponte, Task 8 Step 4E) escreve via config.save; a CLI
+    # le do disco na hora. Sem cache entre processos: e a regra do dono.
+    cfg = config.default_config()
+    cfg["limits"]["standard"] = 5
+    config.save(cfg, path=store)
+    cli(monkeypatch, "--config", "--get", "limits.standard")
+    assert capsys.readouterr().out.strip() == "5"
+
+
+# ——— ler ———
+
+def test_cli_config_get_prints_only_the_value(store, monkeypatch, capsys):
+    cli(monkeypatch, "--config", "--get", "limits.local")
+    out = capsys.readouterr().out
+    assert out.strip() == "4"                       # nada de banner, nada de prefixo
+    assert "Engineering Stack" not in out
+
+
+def test_cli_config_get_is_the_value_the_file_has(store, monkeypatch, capsys):
+    cfg = config.default_config()
+    cfg["limits"]["local"] = 7
+    config.save(cfg, path=store)
+    cli(monkeypatch, "--config", "--get", "limits.local")
+    assert capsys.readouterr().out.strip() == "7"
+
+
+def test_cli_config_get_of_an_unknown_key_is_silent_and_exits_1(
+        store, monkeypatch, capsys):
+    # git config --get: ausencia = silencio no stdout + exit 1. O script que
+    # chama precisa distinguir "4 gravado" de "nada gravado ainda".
+    set_argv(monkeypatch, "--config", "--get", "limits.inexistente")
+    with pytest.raises(SystemExit) as boom:
+        main(Path("thero.py"))
+    assert boom.value.code == 1
+    assert capsys.readouterr().out.strip() == ""
+
+
+def test_cli_config_lists_dotted_scalar_pairs_sorted(store, monkeypatch, capsys):
+    cli(monkeypatch, "--config", "--list")
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if "=" in ln]
+    assert "limits.local=4" in lines
+    assert "routing.mode=zeus" in lines
+    assert lines == sorted(lines)
+    assert not any(ln.startswith("providers") or ln.startswith("agents")
+                   for ln in lines)
+
+
+# ——— recusas ———
+
+def test_cli_config_with_no_argument_prints_usage_and_exits_2(store, monkeypatch):
+    set_argv(monkeypatch, "--config")
+    with pytest.raises(SystemExit) as boom:
+        main(Path("thero.py"))
+    assert boom.value.code == 2
+
+
+def test_cli_config_refuses_any_path_that_is_not_limits(store, monkeypatch):
+    set_argv(monkeypatch, "--config", "routing.athena=llama3.2")
+    with pytest.raises(SystemExit) as boom:
+        main(Path("thero.py"))
+    assert boom.value.code == 2
+    assert not store.exists()                       # nao gravou nada
+
+
+def test_cli_config_refuses_a_value_that_is_not_a_positive_int(store, monkeypatch):
+    for bad in ("0", "-2", "muitos", "4.5"):
+        set_argv(monkeypatch, "--config", "limits.local=%s" % bad)
+        with pytest.raises(SystemExit):
+            main(Path("thero.py"))
+    assert config.load(store)["limits"]["local"] == 4
+
+
+def test_cli_config_refuses_a_credential_shaped_key_even_under_limits(
+        store, monkeypatch):
+    # O dono: "sem nunca guardar nada que seja valor de chave de API".
+    # LIMITS e lista fechada de tres nomes, entao isto e recusado por
+    # construcao -- o teste impede que alguem abra a lista no futuro.
+    set_argv(monkeypatch, "--config", "limits.apikey=sk-SEGREDO")
+    with pytest.raises(SystemExit):
+        main(Path("thero.py"))
+    assert "apikey" not in config.load(store)["limits"]
+
+
+def test_cli_config_never_introduces_a_bom(store, monkeypatch):
+    cli(monkeypatch, "--config", "limits.local=2")
+    assert store.read_bytes()[:3] != b"\xef\xbb\xbf"
+    json.loads(store.read_text(encoding="utf-8"))   # strict: o BOM mataria aqui
+```
+
+> **Por que `set_argv` + `main` explícitos nos testes de recusa:** o helper
+> `cli()` chama `main` por dentro, e `pytest.raises(SystemExit)` precisa envolver
+> a chamada. Mesmo mecanismo de `tests/test_cli.py:12-14`.
+
+- [ ] **Step 2: Rodar para confirmar falha**
+
+Run: `python -m pytest tests/test_config_limits.py -q`
+Expected: FAIL em `AttributeError: module 'thero.presets' has no attribute 'default_limits'` (e `TypeError: object of type 'Namespace' has no attribute 'config'` nos que chegam mais longe).
+
+- [ ] **Step 3: Implementação — defaults e store**
+
+Em `src/thero/presets.py`, acrescentar antes de `default_routing()`:
+
+```python
+LIMITS = ("local", "standard", "premium")
+
+
+def default_limits() -> dict:
+    """Teto de chamadas simultaneas por tipo de modelo (decisao do dono,
+    2026-09-28). Os valores sao a recomendacao dele, nao um chute: `local` = 4
+    porque o gargalo e o contexto/VRAM da maquina, nao a fatura; `standard` = 3
+    e o meio-termo entre fila e custo; `premium` = 2 porque a cota cara estoura
+    antes de qualquer fila. Quem OBSUSTA o teto e o Zeus (outro satellite,
+    `2026-09-28-zeus-governador-de-modelos`); este modulo e a unica fonte dos
+    numeros -- tela, CLI e ponte leem daqui.
+    """
+    return {"local": 4, "standard": 3, "premium": 2}
+```
+
+Em `src/thero/config.py`, acrescentar `"limits": presets.default_limits(),`
+dentro do dict de `default_config()` (entre `routing` e `preferences`) e, no fim
+do arquivo, os três helpers de caminho pontilhado:
+
+```python
+# So `limits` e escrevivel por linha de comando. `routing`, `preferences` sao
+# lidos (`--get`/`--list`) e gravados pelas telas; `providers`/`agents` nem uma
+# coisa nem outra por aqui -- sao listas de estruturas e `providers` e onde vive
+# qualquer nome de variavel de credencial (regra inegociavel 4).
+WRITABLE_SECTIONS = ("limits",)
+READABLE_SECTIONS = ("limits", "routing", "preferences")
+
+
+def get_dotted(cfg: dict, path: str):
+    """(encontrado, valor) para 'limits.local'. Nenhum dict/lista: folha
+    escalar ou nada, porque `--get` promete uma linha imprimivel."""
+    parts = path.split(".")
+    if len(parts) != 2:
+        return False, None
+    node = cfg.get(parts[0])
+    if not isinstance(node, dict) or parts[1] not in node:
+        return False, None
+    value = node[parts[1]]
+    if isinstance(value, (dict, list)):
+        return False, None
+    return True, value
+
+
+def set_dotted(cfg: dict, path: str, raw: str):
+    """Aplica `limits.<tipo>=<int>` no dict em memoria e devolve o erro humano
+    (ou None). NAO grava: quem chama decide quando persistir, para o
+    read-modify-write ser uma operacao só."""
+    parts = path.split(".")
+    if len(parts) != 2 or parts[0] not in WRITABLE_SECTIONS:
+        return "%s nao se ajusta por linha de comando: use a interface " \
+               "(ou --config limits.local=4)" % path
+    section, key = parts
+    if section == "limits":
+        if key not in presets.LIMITS:
+            return "tipo de modelo desconhecido: %s (validos: %s)" % (
+                key, ", ".join(presets.LIMITS))
+        # isdecimal e nao isdigit: "isdigit()" aceita sobrescrito U+00B2, e
+        # int("²") estoura ValueError para fora da CLI com o argv do usuario.
+        if not raw.lstrip("-").isdecimal():
+            return "limits.%s so aceita numero inteiro" % key
+        value = int(raw)
+        if value < 1 or value > 64:
+            return "limits.%s fica entre 1 e 64 (recebi %d)" % (key, value)
+        node = dict(cfg.get(section) or {})
+        node[key] = value
+        cfg[section] = node
+        return None
+    return "escrita nao implementada para %s" % path
+
+
+def iter_scalars(cfg: dict):
+    """`chave=valor` ordenado, uma linha por folha escalar das seicoes que o
+    terminal entende. e o render do `--config --list`; listas ficam de fora
+    por decisao, nao por esquecimento (ver WRITABLE_SECTIONS acima)."""
+    rows = []
+    for section in READABLE_SECTIONS:
+        node = cfg.get(section)
+        if not isinstance(node, dict):
+            continue
+        for key, value in node.items():
+            if isinstance(value, (dict, list)):
+                continue
+            rows.append("%s.%s=%s" % (section, key, value))
+    return sorted(rows)
+```
+
+- [ ] **Step 4: Implementação — a flag na CLI**
+
+Em `src/thero/cli.py`, no parser (depois de `--publish-out`, linha 471), na
+mesma formatação dos vizinhos (`help=` texto longo, sem emoji):
+
+```python
+    parser.add_argument(
+        "--config",
+        nargs="*",
+        metavar="limits.<tipo>=<int>",
+        help=(
+            "Le ou escreve ~/.thero/config.json no estilo `git config` "
+            "(ex.: thero --config limits.local=4). Somente a chave `limits`; "
+            "--config --get limits.local e --config --list fazem leitura."
+        ),
+    )
+    parser.add_argument(
+        "--get",
+        metavar="limits.<tipo>",
+        help="Com --config: imprime apenas o valor da chave (exit 1 se ausente).",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="Com --config: lista chave=valor, uma por linha, ordenado.",
+    )
+```
+
+Em `main()`, **imediatamente depois** do ramo `--mcp` e **antes** do
+`print("=" * 70)` do banner (`cli.py:490-498`) — o banner poluiria a saída de um
+comando que se pretende pipe-ável:
+
+```python
+    # ---------------------------------------------------------------
+    # --config, estilo `git config`: a MESMA fonte da interface
+    # (~/.thero/config.json, sem cache entre os dois caminhos). Le/gravar
+    # escalares; nunca imprime o banner. `--get` imprime so o valor e sai 1
+    # se a chave nao existe. Escrever so aceita limits.* (ver
+    # config.WRITABLE_SECTIONS): provedor/programa tem tela propria, e a
+    # regra "nunca gravar valor de chave" nao se negocia por argv.
+    # ---------------------------------------------------------------
+    if args.config is not None or args.get is not None or args.list:
+        _dispatch_config(args)
+        return
+```
+
+E a função no mesmo arquivo (antes de `main`):
+
+```python
+def _dispatch_config(args) -> None:
+    if args.config is None:
+        _config_usage("--get e --list usam-se com --config (ex.: "
+                      "--config --list).")
+        return
+    if args.get is not None:
+        found, value = config.get_dotted(config.load(), args.get)
+        if not found:
+            sys.exit(1)                     # silencio ao stderr: git faz o mesmo
+        print(value)
+        return
+    if args.list:
+        for row in config.iter_scalars(config.load()):
+            print(row)
+        return
+    if len(args.config) != 1 or "=" not in args.config[0]:
+        _config_usage("falta o par chave=valor (ex.: --config limits.local=4).")
+        return
+    path, raw = args.config[0].split("=", 1)
+    cfg = config.load()                     # le do disco: fonte unica
+    problem = config.set_dotted(cfg, path.strip(), raw.strip())
+    if problem:
+        _config_usage(problem)              # sai 2 aqui: nada e gravado
+        return
+    config.save(cfg)                        # atomico, sem BOM (config.py:60-72)
+    print("%s.%s=%s" % ("limits", path.split(".")[-1],
+                        cfg["limits"][path.split(".")[-1]]))
+
+
+def _config_usage(problem: str) -> None:
+    print(f"[ERRO] {problem}")
+    print()
+    print("Uso:")
+    print("  thero --config limits.local=4       teto de chamadas simultaneas")
+    print("  thero --config --get limits.local    le um valor")
+    print("  thero --config --list                lista tudo que o terminal le")
+    sys.exit(2)
+```
+
+Acrescentar ao `HELP_EPILOG_TEMPLATE`, na seção COMANDOS:
+
+```
+    --config           Le/escreve ~/.thero/config.json no estilo `git config`.
+                       --config limits.local=4 · --config --get limits.local
+                       --config --list. Somente a chave `limits`.
+```
+
+- [ ] **Step 5: Rodar**
+
+Run: `python -m pytest tests/ -q`
+Expected: `428 + 15 = 443 passed`. Contagem verificável sem confiar na aritmética:
+`grep -c "^def test" tests/test_config_limits.py` → `15`. A base de 428 é a
+medida no fim da Task 6 revisada (`22ea931` + a retenção de backup da Task 5,
+`5fcc3b7`, rodado nesta sessão: `428 passed in 2.71s`).
+
+- [ ] **Step 6: Verificação manual dos três formatos (é o contrato dele)**
+
+```bash
+python src/thero/cli.py --config limits.local=4
+python src/thero/cli.py --config --get limits.local
+python src/thero/cli.py --config --list
+python src/thero/cli.py --config routing.athena=llama3.2   # tem de recusar
+cat ~/.thero/config.json                                    # limits visivel
+```
+Expected: a primeira imprime `limits.local=4` **sem banner**; a segunda imprime
+`4` (uma linha, nada mais); a terceira lista `limits.*`, `routing.*`,
+`preferences.*` em ordem alfabética; a quarta sai com código 2, mostra o exemplo
+de uso e **não** altera o arquivo. Conferir no `cat` que a chave está gravada com
+acento legível (nada de `\u00e7`) e sem BOM (`file ~/.thero/config.json` não
+menciona "with BOM").
+
+- [ ] **Step 7: Commit (pedir confirmação)**
+
+```bash
+git add src/thero/presets.py src/thero/config.py src/thero/cli.py tests/test_config_limits.py
+git commit -m "feat(config): git-style --config reading and writing the limits ceiling"
+```
+
+---
+
 ### Task 7: `stream_command` — saída de processo linha a linha
 
 **Files:**
@@ -4485,7 +4941,7 @@ reatribuição por:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `350 + 6 = 356 passed` (os testes que cobriam `run_command` continuam passando — comportamento externo inalterado)
+Expected: `443 + 6 = 449 passed` (os testes que cobriam `run_command` continuam passando — comportamento externo inalterado; a base 443 é a medida no fim da Task 6b, e este bloco prescreve exatamente 6 `def test_` — conferir com `grep -c "^def test" tests/test_process_stream.py`).
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -5369,23 +5825,829 @@ Acrescentar ao `HELP_EPILOG_TEMPLATE`, na seção COMANDOS:
                        Usado pelo TheroHost.ps1; nao tem saida humana.
 ```
 
+- [ ] **Step 4B: progresso na baixa — `("progress", {...})` no `localmodels.pull` (decisão 2, lado do motor)**
+
+O dono foi explícito: *"quero um progress visual na interface (no terminal nao
+precisa)"*. O Ollama já manda o número — cada linha NDJSON de um `pull` traz
+`completed`/`total` em **bytes da camada em voo** — e `_pull()` hoje joga isso
+fora: `localmodels.py:235` entrega só `event.get("status") or line`. O número
+nasce aqui; a barra (Task 10 Step 6B) apenas pinta.
+
+Acrescentar dentro do laço de `_pull()`, substituindo o `yield ("out",
+event.get("status") or line)` existente por:
+
+```python
+                # docs.ollama.com/api (tag pull): cada fase traz completed/total
+                # em BYTES da camada em voo. Nao existe numero cumulativo do
+                # modelo inteiro -- por isso a barra e POR FASE e o texto
+                # ("pulling manifest", "verifying sha256", "writing blob")
+                # continua sendo o que diz em que parte da baixa estamos.
+                completed = event.get("completed")
+                total = event.get("total")
+                if isinstance(completed, int) and isinstance(total, int) \
+                        and total > 0:
+                    # A linha de texto VAI IGUAL (o painel de terminal precisa
+                    # dela); ('progress', ...) e evento IRMAO, nunca
+                    # substituicao -- e a razao pela qual os 20 testes
+                    # existentes de pull continuam passando: nenhum deles tem
+                    # completed/total no corpo.
+                    yield ("out", event.get("status") or line)
+                    yield ("progress", {
+                        "status": event.get("status") or "",
+                        "digest": event.get("digest") or "",
+                        "completed": completed,
+                        "total": total,
+                        "pct": int(completed * 100 / total),
+                        "human": "%s / %s" % (human_bytes(completed),
+                                              human_bytes(total)),
+                    })
+                    continue
+                yield ("out", event.get("status") or line)
+```
+
+Testes em `tests/test_localmodels.py` (**+3**, com o `FakeUrlopen` que já existe
+no arquivo):
+
+```python
+def test_pull_emits_a_progress_event_next_to_the_line(monkeypatch):
+    body = (json.dumps({"status": "pulling blob", "digest": "sha256:aa",
+                        "total": 1000, "completed": 250}).encode() + b"\n"
+            + json.dumps({"status": "success"}).encode() + b"\n")
+    monkeypatch.setattr(localmodels, "urlopen", FakeUrlopen(body))
+    events = list(localmodels.pull("x", base="http://127.0.0.1:11434"))
+    assert ("out", "pulling blob") in events
+    progress = [e for e in events if e[0] == "progress"]
+    assert len(progress) == 1
+    assert progress[0][1]["pct"] == 25
+    assert progress[0][1]["digest"] == "sha256:aa"
+    assert events[-1] == ("exit", 0)
+
+
+def test_pull_without_totals_produces_no_progress_event(monkeypatch):
+    # Os 20 testes existentes afirmam a lista INTEIRA dos eventos; se este
+    # ramo disparasse sem numero, todos romperiam por igualdade de lista.
+    body = json.dumps({"status": "pulling manifest"}).encode() + b"\n"
+    monkeypatch.setattr(localmodels, "urlopen", FakeUrlopen(body))
+    events = list(localmodels.pull("x", base="http://127.0.0.1:11434"))
+    assert [e[0] for e in events] == ["out", "exit"]
+
+
+def test_progress_human_bytes_and_pct_are_consistent(monkeypatch):
+    body = (json.dumps({"status": "pulling blob", "total": 2048,
+                        "completed": 1024}).encode() + b"\n")
+    monkeypatch.setattr(localmodels, "urlopen", FakeUrlopen(body))
+    progress = [e[1] for e in
+                localmodels.pull("x", base="http://127.0.0.1:11434")
+                if e[0] == "progress"][0]
+    assert progress["pct"] == 50
+    assert "/" in progress["human"]                 # "1.0 KB / 2.0 KB"
+    assert progress["completed"] == 1024 and progress["total"] == 2048
+```
+
+- [ ] **Step 4C: baixa longa = worker dedicado + cancelamento + recusa de
+  concorrência (decisão 1 do dono, 2026-09-28)**
+
+Por que precisa existir: o `serve()` do Step 3 le **uma** linha de stdin por vez
+e e single-thread. O ramo `if cmd == "models-pull"` consome a geradora **dentro**
+de `handle_request`: durante um `ollama pull` a ponte nao atende nada — nem
+`ping`, nem o proximo clique. E o teto de leitura e **por read, nao por
+duracao** (`OLLAMA_PULL_TIMEOUT = 1800` s, `settings.py:54`): uma baixa de varios
+GB, com fases `verifying sha256`/`writing blob` mudas, congela a janela inteira.
+
+Regras do dono, literais: resposta **imediata** (`accepted`) enquanto a baixa
+corre fora da thread do proximo pedido; **dois pedidos de baixa simultaneos
+recusados no motor** com mensagem humana ("ja existe uma baixa em andamento"),
+porque a janela so mostra uma barra; **sem worker geral** — nada de thread pool
+no `serve()`. `run`, `skills-install`, `skills-check`/`update` continuam
+bloqueando o proprio pedido e continuam cancelaveis pelo `engine-cancel` do host
+(la existe filho de verdade para matar, com `taskkill /T`).
+
+Acrescentar em `src/thero/bridge.py` (o modulo hoje nao importa `threading`):
+
+```python
+import threading
+
+
+def _write(dst, lock, message: dict) -> None:
+    """Uma linha JSON por escrita, com lock. O worker de baixa e o laco do
+    `serve()` escrevem no mesmo stdout; sem lock, duas linhas intercaladas no
+    meio corrompem o canal JSON-lines e derrubam a janela (regra inegociavel 3
+    + Task 9 Step 2B, que le uma linha por vez)."""
+    with lock:
+        dst.write(json.dumps(message, ensure_ascii=False) + "\n")
+        dst.flush()
+
+
+class PullWorker:
+    """Uma baixa de modelo fora da thread que atende o proximo pedido.
+
+    So existe para este caminho (decisao do dono). Nao escreve em disco e nao
+    guarda nada do modelo: o download e do Ollama, a ponte so sabe se acabou.
+    `daemon=True` porque fechar a janela derruba o processo do motor — uma
+    thread nao-daemon seguraria o interprete no meio de um download de GB.
+    """
+
+    def __init__(self, req_id, name, base, emit, write_reply):
+        self.req_id = req_id
+        self.name = name
+        self.base = base
+        self.emit = emit
+        self.write_reply = write_reply
+        self.stop = threading.Event()
+        self.response = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def alive(self) -> bool:
+        return self.thread.is_alive()
+
+    def abort(self) -> bool:
+        """Para de ler E fecha o socket. So o evento nao bastaria: um `read()`
+        parado so olharia o flag quando o daemon mandasse a proxima linha — o
+        teto e 1800 s de silencio por leitura. Fechar a resposta acorda o read
+        com OSError, tratado no laco abaixo."""
+        self.stop.set()
+        try:
+            if self.response is not None:
+                self.response.close()
+                return True
+        except OSError:
+            pass
+        return False
+
+    def _watch(self, response) -> None:
+        self.response = response
+
+    def _run(self) -> None:
+        code, cancelled = 1, False
+        try:
+            for kind, payload in localmodels.pull(
+                    self.name, base=self.base, stop=self.stop,
+                    watch=self._watch):
+                if kind == "exit":
+                    code = payload
+                    continue
+                if self.stop.is_set():
+                    code, cancelled = 130, True
+                    break
+                if kind == "progress":
+                    self.emit(_line(self.req_id, payload["status"],
+                                    progress=payload))
+                else:
+                    self.emit(_line(self.req_id, payload))
+            if self.stop.is_set():
+                code, cancelled = 130, True
+        except Exception as exc:  # noqa: BLE001 - a thread nunca leva o processo junto
+            self.write_reply(_err(self.req_id,
+                                  "a baixa falhou: %s: %s"
+                                  % (type(exc).__name__, exc)))
+            return
+        self.write_reply(_ok(self.req_id, {
+            "exitCode": code, "ok": code == 0, "cancelled": cancelled,
+            "name": self.name, "final": True}))
+
+
+def _handle_pull(state: BridgeState, request: dict, emit, write_reply):
+    cmd = request["cmd"]
+    if cmd == "models-pull":
+        if write_reply is None:
+            # O worker escreve no canal DEPOIS que o pedido foi respondido. Sem
+            # canal (chamada direta em teste solto, outra integracao) nao ha
+            # para onde voltar -- recusar limpo, nao somir em silencio.
+            return _err(request["id"], "models-pull so roda dentro de serve()")
+        name = (request.get("name") or "").strip()
+        if not isinstance(name, str) or not name:
+            return _err(request["id"], "informe o nome do modelo")
+        with state.pull_lock:
+            running = state.pull
+            if running is not None and running.alive():
+                return _err(request["id"],
+                            "ja existe uma baixa em andamento (%s): aguarde "
+                            "ou cancele" % running.name)
+            worker = PullWorker(request["id"], name, _ollama_base(state.load()),
+                                emit, write_reply)
+            state.pull = worker
+            worker.start()
+        return _ok(request["id"], {"accepted": True, "name": name,
+                                   "id": request["id"]})
+    if cmd == "models-pull-cancel":
+        with state.pull_lock:
+            worker = state.pull
+        if worker is None or not worker.alive():
+            return _ok(request["id"], {"cancelled": False, "name": "",
+                                       "msg": "nenhuma baixa em andamento"})
+        closed = worker.abort()
+        return _ok(request["id"], {
+            "cancelled": True, "aborted": closed, "name": worker.name,
+            "msg": ("parei de acompanhar a baixa e fechei a conexao com o "
+                    "Ollama." if closed else
+                    "parei de acompanhar a baixa; a conexao ja tinha caido.")})
+    return None
+```
+
+Ligacao no `serve()` / `handle_request` (editacoes cirurgicas sobre o bloco do
+Step 3 — **nao** reescrever o entorno que a auditoria de costura ja marcou):
+
+- Em `BridgeState.__init__`, no **corpo** (nao na assinatura: os testes do Step 1
+  constroem com kwargs): `self.pull_lock = threading.Lock()` e `self.pull = None`.
+- Em `serve()`: `write_lock = threading.Lock()`; `emit` passa a chamar
+  `_write(dst, write_lock, message)`; a escrita da resposta final vira
+  `_write(dst, write_lock, response)`; e `handle_request(...)` recebe
+  `write_reply=lambda msg: _write(dst, write_lock, msg)`.
+- `handle_request(request, state, *, emit=None, write_reply=None)`: rotear
+  `models-pull`/`models-pull-cancel` para `_handle_pull(state, request, emit,
+  write_reply)` **antes** de `_handle_models`.
+- Em `_handle_models`: **apagar** o ramo `if cmd == "models-pull"` inteiro
+  (substituido por este passo) e extrair o laco que procura o provedor ollama
+  para `_ollama_base(cfg) -> str` (comportamento inalterado; os Steps 4C e 4D
+  passam a usar).
+- No bloco de testes do Step 1: **sai** `test_models_pull_streams` (o contrato
+  agora e assincrono).
+
+> **O que "matar o filho, nao so parar de ler" quer dizer aqui — e o que nao
+> quer.** Na ponte, `ollama pull` **nao e subprocesso**: e um `POST /api/pull` ao
+> daemon que o usuario iniciou (`localmodels.py:197-210`). Fechar o nosso socket
+> para de *ler*; se o daemon continua a baixa por conta propria, o modelo aparece
+> na lista mais tarde e a barra teria que contar mentira. **Medir antes de
+> codar** (nesta maquina o Ollama nao existe — tabela de fatos, `where ollama`
+> vazio — entao a medicao e passo de execucao em maquina com ele instalado):
+>
+> ```bash
+> # dispara uma baixa grande pela interface, cancela, e no terminal:
+> powershell -NoProfile -Command '1..30 | %{ "{0:N1} GB" -f ((gci "$env:USERPROFILE\.ollama\models" -Recurse -File -EA SilentlyContinue | measure Length -Sum).Sum/1GB); sleep 2 }'
+> curl -s http://127.0.0.1:11434/api/ps
+> ```
+>
+> **Se o tamanho continuar crescendo depois do cancelamento** (o esperado: o
+> Ollama nao tem endpoint de cancelamento de pull), entao: (a) **NAO** trocar o
+> caminho por `stream_command(["ollama","pull",...])` — matar o CLI tambem nao
+> derruba o daemon, seria um filho decorativo; (b) o abort real e o
+> `engine-restart` do Step 4D, e a tela tem de dizer isso com essas palavras,
+> nunca um "cancelado" seco; (c) depois de cancelar a UI reconsulta
+> `models-status`, e a lista e a verdade final. Registrar a medicao no commit
+> desta task.
+
+**Assinatura nova do `localmodels.pull`** (aditiva, tudo palavra-chave com
+default, para os 20 testes existentes não serem tocados):
+`def pull(name, base="", stop=None, watch=None)` e
+`def _pull(name, url_base, stop=None, watch=None)`. Logo depois de
+`with urlopen(request, timeout=OLLAMA_PULL_TIMEOUT) as response:` →
+`if watch is not None: watch(response)`. No topo do laço de linhas →
+`if stop is not None and stop.is_set(): yield ("out", "baixada cancelada"); yield ("exit", 130); return`. O `except (OSError, ...)` existente passa a
+tratar também o fechamento vindo de outra thread: se `stop` estiver setado,
+devolve `("out", "baixada cancelada")` + `("exit", 130)` em vez de `("exit", 1)`.
+
+Testes (**+2 em `tests/test_localmodels.py`**):
+
+```python
+def test_pull_stop_set_midstream_returns_exit_130(monkeypatch):
+    import threading
+    stop = threading.Event()
+    body = b"".join(json.dumps({"status": "linha %d" % i}).encode() + b"\n"
+                    for i in range(4))
+
+    class Stubborn(FakeUrlopen(body)):
+        def __iter__(self):
+            for raw in super().__iter__():
+                stop.set()                    # o cancelamento chega no meio
+                yield raw
+
+    monkeypatch.setattr(localmodels, "urlopen", Stubborn)
+    events = list(localmodels.pull("x", base="http://127.0.0.1:11434",
+                                   stop=stop))
+    assert events[-1] == ("exit", 130)
+    assert ("out", "baixada cancelada") in events
+
+
+def test_pull_watch_hands_the_response_to_the_caller(monkeypatch):
+    # O worker precisa conseguir FECHAR o socket; sem o objeto na mao, o
+    # cancelamento acordaria so na proxima linha (ate 1800 s de espera).
+    seen = {}
+    body = json.dumps({"status": "pulling manifest"}).encode() + b"\n"
+    fake = FakeUrlopen(body)
+    monkeypatch.setattr(localmodels, "urlopen", fake)
+    list(localmodels.pull("x", base="http://127.0.0.1:11434",
+                          watch=lambda r: seen.__setitem__("r", r)))
+    assert seen["r"] is fake.responses[0]
+```
+
+Testes (**+9 em `tests/test_bridge.py`** — com os 4 do Step 4D e os 6 do Step 4E
+o arquivo fecha em **48** `def test_` = 30 do Step 1 − 1 removido + 19):
+
+```python
+def test_models_pull_answers_immediately(state, monkeypatch):
+    monkeypatch.setattr(bridge.localmodels, "pull",
+                        lambda name, base="", stop=None, watch=None:
+                        iter([("out", "devagar"), ("exit", 0)]))
+    replies = []
+    out = call(state, {"id": 40, "cmd": "models-pull", "name": "llama3.2"},
+               emit=lambda m: None, write_reply=replies.append)
+    assert out == {"id": 40, "ok": True,
+                   "result": {"accepted": True, "name": "llama3.2", "id": 40}}
+
+
+def test_the_pull_lines_and_the_final_reply_carry_the_request_id(state, monkeypatch):
+    # O pedido ja foi respondido; o que chega depois tem de vir com o MESMO id,
+    # senao o Host e o app.js nao entregam na barra certa.
+    ...
+
+
+def test_a_second_pull_is_refused_with_a_human_message(state, monkeypatch): ...
+def test_models_pull_cancel_stops_the_worker(state, monkeypatch): ...
+def test_models_pull_cancel_without_a_worker_is_not_an_error(state): ...
+def test_models_pull_needs_the_write_channel(state): ...
+def test_serve_serialises_worker_lines_and_replies(state, monkeypatch): ...
+def test_a_progress_event_rides_on_the_line_envelope(state, monkeypatch): ...
+def test_a_plain_line_carries_no_extra_keys(state, monkeypatch): ...
+```
+
+> Os oito `...` acima **não** estão vagos por esquecimento: o bloco inteiro do
+> Step 1 vai ser reescrito pela auditoria de costura, e eu não escrevo por cima
+> dele. Quem executa a Task 8 escreve os corpos contra os blocos finais,
+> afirmando exatamente estes contratos e nada além deles:
+> `test_the_pull_lines_...` — `emit` recebeu `{"id": 40, "event": "line", "text":
+> "devagar"}` **e** `write_reply` recebeu `{"id": 40, "ok": True, "result":
+> {"exitCode": 0, "final": True, "cancelled": False, "name": "llama3.2"}}`, nessa
+> ordem; `test_a_second_pull_...` — `out["ok"] is False`,
+> `"ja existe uma baixa em andamento"` em `out["error"]`, e o segundo
+> `localmodels.pull` **nunca** chamado (spy com contador);
+> `test_models_pull_cancel_stops_the_worker` — `{"cancelled": True}` e
+> `state.pull.stop.is_set()`; `test_models_pull_cancel_without_...` — `ok is True`
+> com `{"cancelled": False}`; `test_models_pull_needs_the_write_channel` — `_err`
+> quando `write_reply` não é passado; `test_serve_serialises_...` — `serve()` com
+> um pull lento monkeypatchado + dois `ping`, e **toda** linha da saída faz
+> `json.loads` (nenhuma intercalada); `test_a_progress_event_...` — o envelope tem
+> `pct/completed/total/digest` além de `id/event/text`;
+> `test_a_plain_line_...` — igualdade exata com `{"id","event","text"}` (é o que
+> protege o `test_run_accepts_a_known_flag_and_streams_lines` do Step 1). Se um
+> contrato não fechar como escrito, **parar e reportar**, não afrouxar o teste.
+
+- [ ] **Step 4D: motor local ausente — checar / iniciar / reiniciar (decisão 3
+  do dono, 2026-09-28)**
+
+Palavra dele: *"precisamos apenas checar o status e iniciar ou mesmo reiniciar
+caso necessario (o ollama)"*. As três operações, cada uma com gatilho explícito e
+contrato de retorno:
+
+| Operação | Gatilho explícito | Quem faz | Contrato de retorno |
+|---|---|---|---|
+| **checar status** | sempre passivo, sem processo: abrir a tela, "Reescanear", hidratar | **já existe** — `localmodels.status()` via `models-status` | `{"up": bool, "base": str, "models": [...], "error": str}` |
+| **iniciar** | botão "Iniciar Ollama" quando `up` é false; **ou** um clique que precisa do motor (Baixar / Reescanear) com ele caído. **Nunca** no arranque da janela | `engine-start` → `localmodels.start()` | `{"ok","up","started","pending","msg"}` |
+| **reiniciar** | **só** clique do usuário, ou logo depois de mudança de config que exija isso, avisando o que vai acontecer. Nenhum outro caminho chama | `engine-restart` → `localmodels.restart()` | `{"ok","up","restarted","stopped","msg"}` |
+
+Regras duras (em código + teste, não em comentário): **nunca manter o motor
+vivo** (nenhum watcher, nenhum retry em background, nenhuma thread de
+monitoramento); **nenhum spawn permanente atrelado à janela** (o filho é
+desanexado: fechar o Thero não o derruba — é o oposto deliberado do
+`python --serve`, que cai com a janela); **nenhum binário no nosso payload**
+(Task 12 confere); **se o Ollama já existe na máquina, perguntar antes de instalar
+qualquer coisa** — e instalar **não é deste plano**: dono é
+`docs/superpowers/plans/2026-09-28-instalacao-do-engine-local.md`. **Passo de
+verificação desta subseção: `ls docs/superpowers/plans/`** — na branch atual ele
+**não** está na árvore (só `2026-09-22-gui-engine-bridge.md`, mais o
+`2026-09-28-registro-de-equipe.md` não-rastreado de outro trabalho), então a
+dependência fica declarada aqui e a UI deste plano oferece **só**
+"Iniciar"/"Reiniciar", nunca "Instalar".
+
+Acrescentar em `src/thero/settings.py` (junto dos outros tetos, linhas 49-57) e
+em `src/thero/localmodels.py` (fim do arquivo; `status()` e o `urlparse` já
+importado servem; **acrescentar os imports que faltam** — `os`, `shutil`,
+`subprocess`, `time`; o módulo hoje só importa `http.client/json/re/urllib`):
+
+```python
+# settings.py
+OLLAMA_START_WAIT = 6      # segundos esperando o daemon responder DENTRO do
+                          # pedido. Curto porque serve() e single-thread: cada
+                          # segundo aqui e a janela sem atender o proximo
+                          # pedido, com o ReadLine() do host parado. Acabou o
+                          # teto sem subir, a resposta diz `pending` e a tela
+                          # re-consulta no proximo clique -- sem worker aqui
+                          # (decisao do dono: worker so no caminho de baixa).
+```
+
+```python
+OLLAMA_WINDOWS_DIRS = (
+    r"%LOCALAPPDATA%\Programs\Ollama\ollama.exe",   # onde o instalador manual poe
+    r"%ProgramFiles%\Ollama\ollama.exe",
+)
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+
+def find_binary() -> str:
+    """O caminho do `ollama` que o USUARIO instalou, ou '' se nao existe.
+
+    Nao baixa nem instala nada — o instalar e do plano
+    2026-09-28-instalacao-do-engine-local.md (outro trabalho, dono dele). Isto
+    so responde "existe na maquina?", que e o que a decisao do dono pede (checar,
+    iniciar, reiniciar) e o que impede alguem de instalar por cima de um Ollama
+    que ja esta la sem perguntar.
+    """
+    found = shutil.which("ollama")
+    if found:
+        return found
+    for pattern in OLLAMA_WINDOWS_DIRS:
+        candidate = os.path.expandvars(pattern)
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def start(wait: int = OLLAMA_START_WAIT) -> dict:
+    """Levanta o motor do usuario como processo DESANEXADO e sonda ate responder.
+
+    Nos nao somos o servico que hospeda o motor: `Popen` e chamado sem que
+    ninguem guarde o objeto, entao fechar a janela nao derruba o Ollama e o
+    Thero tambem nao o reanima. Auto-start no login continua sendo do Ollama.
+    """
+    binary = find_binary()
+    if not binary:
+        return {"ok": False, "up": False, "started": False, "pending": False,
+                "msg": "Ollama nao esta nesta maquina. Instalar e passo do "
+                       "plano 2026-09-28-instalacao-do-engine-local.md; o "
+                       "Thero nao baixa motor nem embute binario."}
+    if status()["up"]:
+        return {"ok": True, "up": True, "started": False, "pending": False,
+                "msg": "O Ollama ja esta no ar: nada a iniciar."}
+    creationflags = 0
+    if os.name == "nt":
+        # creationflags != 0 so no Windows (no POSIX o subprocess levanta
+        # ValueError). DEVNULL nos tres cabos: herdar o stdout da ponte seria
+        # escrever no canal JSON (regra inegociavel 3).
+        creationflags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    try:
+        subprocess.Popen([binary, "serve"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         shell=False, close_fds=True,
+                         creationflags=creationflags)
+    except OSError as exc:
+        return {"ok": False, "up": False, "started": False, "pending": False,
+                "msg": "nao consegui iniciar %s: %s" % (binary, exc)}
+    for _ in range(max(1, int(wait))):
+        if status()["up"]:
+            return {"ok": True, "up": True, "started": True, "pending": False,
+                    "msg": "Ollama no ar (%s)." % binary}
+        time.sleep(1)
+    return {"ok": True, "up": False, "started": True, "pending": True,
+            "msg": "Ollama subindo; reabra a tela de Modelos daqui a pouco."}
+
+
+def _pid_on_port(port: int) -> int:
+    """Quem escuta a porta do daemon, pelo `netstat -ano` do proprio Windows
+    (stdlib-only: nada de psutil). 0 quando nao ha ninguem — e o caso em que
+    'reiniciar' e so 'iniciar'. stdout sempre capturado, mesmo motivo do Popen
+    acima."""
+    if os.name != "nt":
+        return 0
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    for line in out.splitlines():
+        cols = line.split()
+        if len(cols) >= 5 and cols[0].upper() == "TCP" \
+                and cols[1].endswith(":%d" % port) \
+                and cols[3].upper() == "LISTENING":
+            try:
+                return int(cols[4])
+            except ValueError:
+                return 0
+    return 0
+
+
+def restart(wait: int = OLLAMA_START_WAIT) -> dict:
+    """Para o daemon que escuta a porta local e o levanta de novo.
+
+    Alvo = PID do ouvinte da porta, NUNCA `/IM ollama.exe`: matar por nome
+    derrubaria tambem o `ollama serve` que o usuario tem num terminal dele.
+    Peso assumido — e por isso o unico gatilho e clique: baixa em andamento cai
+    junto, e a mensagem diz isso.
+    """
+    if os.name != "nt":
+        return {"ok": False, "up": False, "restarted": False, "stopped": False,
+                "msg": "reiniciar o Ollama so esta implementado no Windows."}
+    parsed = urlparse(status()["base"])
+    port = parsed.port or 11434
+    pid = _pid_on_port(port)
+    if pid:
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                           capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        time.sleep(1)
+    out = start(wait=wait)
+    out["restarted"] = True
+    out["stopped"] = bool(pid)
+    out["msg"] = (("parei o Ollama (PID %d) e levantei de novo; baixas em "
+                   "andamento caem. " % pid + out["msg"]) if pid
+                  else out["msg"])
+    return out
+```
+
+Handlers na ponte — **o único lugar de todo o repositório que chama
+`start()`/`restart()`** (`_handle_models`, ao lado de `models-status`):
+
+```python
+    if cmd == "engine-start":
+        return _ok(request["id"], {"engine": localmodels.start(),
+                                   "ollama": localmodels.status(base)})
+    if cmd == "engine-restart":
+        return _ok(request["id"], {"engine": localmodels.restart(),
+                                   "ollama": localmodels.status(base)})
+```
+
+> **Colisão de nome, para não ler errado:** `engine-start`/`engine-restart` falam
+> do **Ollama**. `Start-Engine`/`Stop-Engine`/`engine-cancel` do host (Task 9)
+> falam do **filho Python** (`thero.py --serve`). Nomes iguais, coisas opostas: no
+> Ollama o filho é desanexado e sobrevive à janela; no Python ele é nosso e cai
+> com ela. Quem escrever os comentários do `bridge.py` repete essa frase — é o que
+> impede alguém de "unificar" os dois caminhos depois. A Task 11 Step 1B prende
+> isto em teste estático (`localmodels.start(` aparece **uma** vez no arquivo).
+
+Testes (**+5 em `tests/test_localmodels.py`**, corpos completos):
+
+```python
+def test_find_binary_prefers_the_path_then_the_known_dirs(monkeypatch, tmp_path):
+    exe = tmp_path / "ollama.exe"
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.setattr(localmodels.shutil, "which", lambda n: str(exe))
+    assert localmodels.find_binary() == str(exe)
+    monkeypatch.setattr(localmodels.shutil, "which", lambda n: None)
+    monkeypatch.setattr(localmodels.os.path, "isfile", lambda p: False)
+    assert localmodels.find_binary() == ""
+
+
+def test_start_without_the_binary_points_at_the_other_plan(monkeypatch):
+    monkeypatch.setattr(localmodels, "find_binary", lambda: "")
+    out = localmodels.start()
+    assert out["ok"] is False and out["started"] is False
+    assert "instalacao-do-engine-local" in out["msg"]
+    assert "baixa" not in out["msg"]              # nao promete baixar nada
+
+
+def test_start_spawns_detached_and_never_holds_the_child(monkeypatch):
+    opened = []
+    monkeypatch.setattr(localmodels, "find_binary", lambda: "C:/ollama.exe")
+    monkeypatch.setattr(localmodels, "status",
+                        lambda base="": {"up": True, "base": "", "models": [],
+                                         "error": ""})
+    monkeypatch.setattr(localmodels.subprocess, "Popen",
+                        lambda argv, **kw: opened.append(kw) or object())
+    out = localmodels.start()
+    assert out["started"] is True and out["up"] is True
+    assert opened[0]["stdout"] is localmodels.subprocess.DEVNULL
+    assert opened[0]["stderr"] is localmodels.subprocess.DEVNULL
+    if localmodels.os.name == "nt":
+        assert opened[0]["creationflags"] & localmodels.DETACHED_PROCESS
+    # o objeto Popen nao e guardado em lugar nenhum: sem handle nao ha como
+    # "manter vivo" nem "derrubar junto com a janela".
+    assert not [n for n in vars(localmodels) if n.startswith("_child")]
+
+
+def test_restart_kills_the_port_owner_then_starts(monkeypatch):
+    killed = []
+    monkeypatch.setattr(localmodels, "_pid_on_port", lambda port: 4321)
+    monkeypatch.setattr(localmodels.subprocess, "run",
+                        lambda argv, **kw: killed.append(argv))
+    monkeypatch.setattr(localmodels, "status",
+                        lambda base="": {"up": True,
+                                         "base": "http://127.0.0.1:11434",
+                                         "models": [], "error": ""})
+    monkeypatch.setattr(localmodels, "start",
+                        lambda wait=0: {"ok": True, "up": True, "started": True,
+                                        "pending": False, "msg": "subiu"})
+    out = localmodels.restart()
+    assert killed[0][:3] == ["taskkill", "/PID", "4321"]
+    assert out["restarted"] is True and out["stopped"] is True
+    assert "PID 4321" in out["msg"]
+
+
+def test_pid_on_port_is_zero_when_nothing_listens(monkeypatch):
+    monkeypatch.setattr(localmodels.os, "name", "posix")
+    assert localmodels._pid_on_port(11434) == 0   # nada de fake no caminho
+```
+
+Testes (**+4 em `tests/test_bridge.py`**):
+
+```python
+def test_engine_start_routes_and_returns_both_shapes(state, monkeypatch):
+    monkeypatch.setattr(bridge.localmodels, "start",
+                        lambda: {"ok": True, "up": True, "started": True,
+                                 "pending": False, "msg": "no ar"})
+    monkeypatch.setattr(bridge.localmodels, "status",
+                        lambda base="": {"up": True, "base": "", "models": [],
+                                         "error": ""})
+    out = call(state, {"id": 50, "cmd": "engine-start"})
+    assert out["ok"] is True
+    assert out["result"]["engine"]["started"] is True
+    assert out["result"]["ollama"]["up"] is True
+
+
+def test_engine_restart_is_a_command_of_its_own(state, monkeypatch): ...
+def test_the_engine_commands_are_declared_in_the_commands_tuple(state): ...
+def test_the_engine_and_config_flags_do_not_leak_into_allowed_flags(state): ...
+```
+
+> Corpos dos três `...` (mesma regra do Step 4C — escrever contra o bloco final):
+> o primeiro afirma `result["engine"]["restarted"] is True` com
+> `localmodels.restart` monkeypatchado; o segundo,
+> `assert "engine-start" in bridge.COMMANDS and "engine-restart" in bridge.COMMANDS`;
+> o terceiro, que `--config`, `--get` e `--list` **não** estão em
+> `ALLOWED_FLAGS` — a janela edita tetos por `limits-get`/`limits-set` (Step 4E),
+> nunca por linha de comando (decisão 4 do dono).
+
+- [ ] **Step 4E: tetos por tipo de modelo na ponte — `limits-get` / `limits-set`
+  (decisão 4 do dono)**
+
+A chave e os defaults nascem na **Task 6b** (`presets.default_limits()`,
+`config.default_config()["limits"]`). Aqui entra o lado da ponte, com a regra que
+ele pediu: **interface e terminal lendo e escrevendo a MESMA fonte, sem cache
+entre os dois caminhos**, e **nunca guardar nada que seja valor de chave de API**.
+
+```python
+def _validate_limits(incoming):
+    """Mesmo validador para `limits-set` e para o `config-set` generico, que
+    senao deixaria a janela gravar `limits: {"local": "muitos"}` pela porta dos
+    fundos. Inteiro 1..64, sem bool — em Python `isinstance(True, int)` e True,
+    e e o bug que o teste abaixo impede."""
+    if not isinstance(incoming, dict) or not incoming:
+        return "limits precisa ser um objeto com as chaves do teto"
+    for key, value in incoming.items():
+        if key not in presets.LIMITS:
+            return "tipo de modelo desconhecido: %s (validos: %s)" % (
+                key, ", ".join(presets.LIMITS))
+        if isinstance(value, bool) or not isinstance(value, int) \
+                or not 1 <= value <= 64:
+            return "limits.%s precisa de inteiro entre 1 e 64" % key
+    return None
+
+
+def _handle_limits(state: BridgeState, request: dict):
+    cmd = request["cmd"]
+    # NAO usa state.load(): o BridgeState cacheia `self._cfg`, entao uma janela
+    # aberta mostraria para sempre o teto que estava la quando ela abriu, mesmo
+    # depois de `thero --config limits.local=6` num terminal. Le o disco;
+    # `persist()` grava o disco E troca o cache na mesma operacao.
+    disk = config_store.load(state.config_path)
+    if cmd == "limits-get":
+        stored = disk.get("limits") if isinstance(disk.get("limits"), dict) else {}
+        merged = dict(presets.default_limits())
+        for key, value in stored.items():
+            if key in presets.LIMITS and not isinstance(value, bool) \
+                    and isinstance(value, int) and 1 <= value <= 64:
+                merged[key] = value
+        return _ok(request["id"], {"limits": merged,
+                                   "defaults": presets.default_limits(),
+                                   "stored": {k: v for k, v in stored.items()
+                                              if k in presets.LIMITS},
+                                   "path": str(state.config_path)})
+    if cmd == "limits-set":
+        problem = _validate_limits(request.get("limits"))
+        if problem:
+            return _err(request["id"], problem)
+        merged = dict(disk.get("limits") or presets.default_limits())
+        merged.update(request["limits"])
+        disk["limits"] = merged
+        state.persist(disk)
+        return _ok(request["id"], {"limits": merged,
+                                   "defaults": presets.default_limits()})
+    return None
+```
+
+E no ramo `config-set` da `_handle_config` (Step 3), três linhas **antes** de
+`state.persist(merged)`:
+
+```python
+        if "limits" in incoming:
+            problem = _validate_limits(incoming["limits"])
+            if problem:
+                return _err(request["id"], problem)
+```
+
+Testes (**+6 em `tests/test_bridge.py`**, corpos completos):
+
+```python
+def test_limits_get_returns_the_defaults_when_the_file_has_none(state):
+    out = call(state, {"id": 60, "cmd": "limits-get"})
+    assert out["result"]["limits"] == {"local": 4, "standard": 3, "premium": 2}
+    assert out["result"]["defaults"] == out["result"]["limits"]
+
+
+def test_limits_get_reads_the_disk_not_the_bridge_cache(state):
+    # O caso que o dono ligou: janela aberta + terminal escrevendo.
+    state.load()                                   # enche o cache com o antigo
+    config_store.save({"limits": {"local": 6, "standard": 3, "premium": 2}},
+                      path=state.config_path)
+    out = call(state, {"id": 61, "cmd": "limits-get"})
+    assert out["result"]["limits"]["local"] == 6
+
+
+def test_limits_set_persists_and_refreshes_the_cache(state):
+    out = call(state, {"id": 62, "cmd": "limits-set", "limits": {"premium": 1}})
+    assert out["ok"] is True
+    assert out["result"]["limits"] == {"local": 4, "standard": 3, "premium": 1}
+    assert config_store.load(state.config_path)["limits"]["premium"] == 1
+    assert state.load()["limits"]["premium"] == 1        # cache invalidado
+
+
+def test_limits_set_refuses_an_unknown_key(state):
+    out = call(state, {"id": 63, "cmd": "limits-set", "limits": {"ultra": 2}})
+    assert out["ok"] is False
+    assert "ultra" in out["error"] and "premium" in out["error"]
+
+
+def test_limits_set_refuses_a_bool_a_zero_and_a_string(state):
+    for bad in ({"local": True}, {"local": 0}, {"local": "muitos"},
+                {"local": 2.5}, {}):
+        out = call(state, {"id": 64, "cmd": "limits-set", "limits": bad})
+        assert out["ok"] is False
+
+
+def test_config_set_refuses_limits_smuggled_through_the_generic_write(state):
+    cfg = config.default_config()
+    cfg["limits"] = {"local": 9999}
+    out = call(state, {"id": 65, "cmd": "config-set", "config": cfg})
+    assert out["ok"] is False
+```
+
+- [ ] **Step 4F: saldo do que estes passos mudam no bloco do Step 3 + `COMMANDS`**
+
+Nada aqui reescreve os blocos que a auditoria de costura já marcou; é a lista do
+que **estes passos tocam**, para o executor saber onde parar:
+
+- imports do `bridge.py`: `import threading` (nada além disso).
+- `BridgeState.__init__` (corpo): `pull_lock`, `pull`.
+- `_line(req_id, text, progress=None)`: ganha o parâmetro; **sem** `progress`, o
+  dict é exatamente `{"id","event","text"}` como hoje.
+- novo `_write(dst, lock, message)`; `serve()` usa `write_lock` nas duas saídas e
+  passa `write_reply`.
+- `handle_request(request, state, *, emit=None, write_reply=None)`: roteia
+  `models-pull`, `models-pull-cancel` (→ `_handle_pull`), `limits-get`,
+  `limits-set` (→ `_handle_limits`, família nova chamada depois de
+  `_handle_models`); `engine-start`/`engine-restart` ficam em `_handle_models`.
+- `_handle_models`: perde o ramo `models-pull`, ganha os dois `engine-*`, extrai
+  `_ollama_base(cfg)`.
+- `_handle_config`: três linhas de validação de `limits` no `config-set`.
+- módulos de motor: `localmodels.py` ganha `find_binary`/`start`/`_pid_on_port`/
+  `restart`, os imports `os/shutil/subprocess/time`, e `pull(..., stop, watch)`;
+  `settings.py` ganha `OLLAMA_START_WAIT`.
+- `COMMANDS` passa a trazer, na família models (literal):
+
+```python
+    "models-status", "models-pull", "models-pull-cancel", "models-delete",
+    "models-set", "engine-start", "engine-restart",
+    "limits-get", "limits-set",
+```
+
+> O `test_the_bridge_command_list_matches_the_ui_vocabulary` da Task 11 exige que
+> todo `Host.send('x')` do `app.js` esteja em `COMMANDS`: os nomes acima são os
+> que a Task 10 usa, letra por letra. **Nenhum deles vai para `ALLOWED_FLAGS`** —
+> flags são o caminho do `run`, e estes são comandos da ponte.
+
+**Contagem reliquada desta task** (a cadeia acumulada, medida, não deduzida):
+
+```bash
+grep -c "^def test" tests/test_bridge.py tests/test_localmodels.py
+python -m pytest tests/ -q
+```
+
+| Arquivo | Antes | Delta prescrito | Depois |
+|---|---|---|---|
+| `tests/test_bridge.py` | 30 (Step 1) | −1 (`test_models_pull_streams`) +9 (4C) +4 (4D) +6 (4E) | **48** |
+| `tests/test_localmodels.py` | 20 (medido hoje: `grep -c "^def test"` = 20) | +3 (4B) +2 (4C) +5 (4D) | **30** |
+| Suíte inteira | 437 (fim da Task 7) | +48 +11 novos | **496** |
+
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `356 + 30 = 386 passed`
+Expected: `437 + 48 + 11 = 496 passed` — conferindo os 48 e os 11 com o `grep -c`
+da tabela acima; se a auditoria tiver removido testes deste bloco ao corrigir os
+chamadores, a base continua 437 e só o segundo termo muda (reportar o número
+final no commit, não reescrever esta linha).
 
 - [ ] **Step 6: Smoke manual do protocolo (sem UI)**
 
 ```bash
-printf '{"id":1,"cmd":"ping"}\n{"id":2,"cmd":"config-get"}\n' \
+printf '{"id":1,"cmd":"ping"}\n{"id":2,"cmd":"config-get"}\n{"id":3,"cmd":"limits-get"}\n{"id":4,"cmd":"limits-set","limits":{"local":6}}\n{"id":5,"cmd":"engine-start"}\n{"id":6,"cmd":"models-pull","name":"llama3.2"}\n{"id":7,"cmd":"models-pull","name":"qwen2.5:1.5b"}\n{"id":8,"cmd":"models-pull-cancel"}\n' \
   | python src/thero/cli.py --serve
 ```
-Expected: duas linhas JSON, `"ok":true`, acentos legíveis (sem `\u00e7`).
+Expected: duas linhas JSON `"ok":true` com acentos legíveis (sem `\u00e7`);
+`limits-get` devolve `{"local":4,...}` e depois `6`; `engine-start` responde o
+shape `{"engine":{...},"ollama":{...}}` com `started:false` e a mensagem do plano
+de instalação nesta máquina (sem Ollama); o **primeiro** `models-pull` responde
+`accepted` na hora, o **segundo** recusa com
+"ja existe uma baixa em andamento", e o `models-pull-cancel` devolve
+`{"cancelled": true, ...}` — e nenhuma linha de saída sai sem `json.loads`
+passar (é o lock de escrita do Step 4C fazendo o trabalho dele).
 
 - [ ] **Step 7: Commit (pedir confirmação)**
 
 ```bash
-git add src/thero/bridge.py src/thero/cli.py tests/test_bridge.py
+git add src/thero/bridge.py src/thero/cli.py src/thero/localmodels.py src/thero/settings.py tests/test_bridge.py tests/test_localmodels.py
 git commit -m "feat(bridge): JSON request bridge with streaming, plus the --serve entry"
 ```
 
