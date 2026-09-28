@@ -624,7 +624,20 @@ git commit -m "feat(config): add provider/agent presets and the ~/.thero/config.
 **Files:**
 - Create: `src/thero/envreport.py`
 - Modify: `src/thero/system/process.py:20-63` (`run_command` ganha teto de tempo opcional)
+- Modify: `src/thero/shell_command/windows.py:14-34` (`resolve_powershell_profile` passa a aceitar `timeout`)
 - Test: `tests/test_envreport.py`
+
+> **Correção da revisão de qualidade (2026-09-22, 4 achados bloqueantes):**
+> (1) a sonda do `$PROFILE` ganhou teto (`PROFILE_TIMEOUT = 5`, propagado até
+> `resolve_powershell_profile`); (2) o import tardio e as operações de filesystem
+> (`iterdir`/`stat`/`glob`) entraram na fronteira protegida — a falha de UM item
+> degrada só aquele campo, nunca o payload inteiro; (3) `_first_line` virou
+> `_version_probe` e devolve `(linha, ok)` com `ok` derivado do `returncode`
+> real — acabou a adivinhação pelo texto; (4) `_command_installed` casa o
+> marcador exato `COMMAND_MARKER_START` (que o instalador do comando global
+> escreve no `$PROFILE`), não a substring `"thero"` — o bloco de ENV da Task 5
+> vive no mesmo arquivo. Contagem de testes da Task 2: 8 → 15; a cadeia
+> inteira de contagens abaixo foi atualizada (+7 em cada passo seguinte).
 
 - [ ] **Step 1: Testes**
 
@@ -634,6 +647,12 @@ git commit -m "feat(config): add provider/agent presets and the ~/.thero/config.
 from pathlib import Path
 
 from thero import envreport
+from thero.settings import (
+    COMMAND_MARKER_END,
+    COMMAND_MARKER_START,
+    ENV_MARKER_END,
+    ENV_MARKER_START,
+)
 
 
 class FakeWhich:
@@ -644,19 +663,28 @@ class FakeWhich:
         return "/usr/bin/%s" % name if name in self.found else None
 
 
-def _snap(tmp_path, monkeypatch, found, runner=None, ollama=None):
+def _patched(monkeypatch, found, runner=None, ollama=None):
     monkeypatch.setattr(envreport, "_which", FakeWhich(found))
-    monkeypatch.setattr(envreport, "_first_line",
-                        runner or (lambda cmd: "%s ok" % cmd[0]))
+    monkeypatch.setattr(envreport, "_version_probe",
+                        runner or (lambda cmd: ("%s ok" % cmd[0], True)))
     monkeypatch.setattr(envreport, "_ollama_probe",
                         lambda: ollama or {"up": False, "host": "", "models": [],
                                            "error": ""})
     monkeypatch.setattr(envreport, "_profile_path", lambda: None)
+
+
+def _home(tmp_path):
     skills = tmp_path / ".claude" / "skills"
     (skills / "react").mkdir(parents=True)
     (skills / "react" / "SKILL.md").write_text("# react", encoding="utf-8")
     (tmp_path / ".claude" / "CLAUDE.md").write_text("x" * 40, encoding="utf-8")
-    return envreport.snapshot(entry_path=Path("thero.py"), home=tmp_path,
+    return tmp_path
+
+
+def _snap(tmp_path, monkeypatch, found, runner=None, ollama=None):
+    _patched(monkeypatch, found, runner, ollama)
+    home = _home(tmp_path)
+    return envreport.snapshot(entry_path=Path("thero.py"), home=home,
                               config_path=tmp_path / ".thero" / "config.json")
 
 
@@ -668,16 +696,19 @@ def test_reports_every_program_the_ui_asks_about(tmp_path, monkeypatch):
 
 
 def test_broken_npx_is_reported_as_present_but_failing(tmp_path, monkeypatch):
-    # estado REAL desta maquina em 2026-09-22: o shim existe e morre no npm-prefix
+    # estado REAL desta maquina em 2026-09-22: o shim existe e morre no
+    # npm-prefix (exit != 0) -- e o returncode, nao o texto, que diz isso.
     s = _snap(tmp_path, monkeypatch, ["node", "npx"],
-              runner=lambda cmd: "Error: Cannot find module ...npm-prefix.js")
+              runner=lambda cmd: ("Error: Cannot find module ...npm-prefix.js",
+                                  False))
     assert s["tools"]["npx"]["found"] is True
     assert s["tools"]["npx"]["ok"] is False
     assert "npm-prefix" in s["tools"]["npx"]["detail"]
 
 
 def test_tool_without_version_output_is_not_ok(tmp_path, monkeypatch):
-    s = _snap(tmp_path, monkeypatch, ["node"], runner=lambda cmd: "")
+    # exit 0 sem saida tambem nao confirma nada
+    s = _snap(tmp_path, monkeypatch, ["node"], runner=lambda cmd: ("", True))
     assert s["tools"]["node"]["found"] is True
     assert s["tools"]["node"]["ok"] is False
 
@@ -701,9 +732,96 @@ def test_a_hanging_version_probe_becomes_empty_instead_of_a_frozen_gui(monkeypat
         raise subprocess.TimeoutExpired(command, kw.get("timeout") or 0)
 
     monkeypatch.setattr(envreport, "run_command", fake_run)
-    assert envreport._first_line(["claude"]) == ""
+    assert envreport._version_probe(["claude"]) == ("", False)
     assert seen["command"] == ["claude", "--version"]
     assert seen["timeout"] == 10
+
+
+def test_a_hanging_profile_probe_becomes_none_instead_of_a_frozen_gui(monkeypatch):
+    # Espelho da sonda de versao: `powershell -NoProfile -Command $PROFILE`
+    # sem teto e o mesmo congelamento, no mesmo loop de stdio.
+    import subprocess
+
+    from thero.shell_command import windows
+
+    seen = {}
+
+    def fake_run(command, **kw):
+        seen["command"] = command
+        seen["timeout"] = kw.get("timeout")
+        raise subprocess.TimeoutExpired(command, kw.get("timeout") or 0)
+
+    monkeypatch.setattr(windows, "run_command", fake_run)
+    monkeypatch.setattr(envreport.platform, "system", lambda: "Windows")
+    assert envreport._profile_path() is None
+    assert seen["command"] == ["powershell", "-NoProfile", "-Command", "$PROFILE"]
+    assert seen["timeout"] == envreport.PROFILE_TIMEOUT == 5
+
+
+def test_profile_probe_survives_a_broken_import(monkeypatch):
+    # O import tardio tem de viver DENTRO da fronteira protegida: modulo
+    # injetavel/quebrado degrada so o campo profilePath, nunca o payload.
+    import sys
+
+    monkeypatch.setattr(envreport.platform, "system", lambda: "Windows")
+    monkeypatch.setitem(sys.modules, "thero.shell_command.windows", None)
+    assert envreport._profile_path() is None
+
+
+def test_a_denied_skills_folder_counts_zero_without_killing_the_snapshot(tmp_path, monkeypatch):
+    # PermissionError em UM item da fronteira fs nao derruba a tela de Status.
+    _patched(monkeypatch, ["node"])
+    home = _home(tmp_path)
+    skills = home / ".claude" / "skills"
+    real_iterdir = Path.iterdir
+
+    def iterdir(self):
+        if self == skills:
+            raise PermissionError(13, "negada")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    s = envreport.snapshot(entry_path=Path("thero.py"), home=home,
+                           config_path=tmp_path / ".thero" / "config.json")
+    assert s["skills"]["installed"] == 0
+    assert s["claudeMd"]["exists"] is True
+    assert s["tools"]["node"]["ok"] is True
+
+
+def test_a_denied_claude_md_degrades_only_its_field(tmp_path, monkeypatch):
+    # TOCTOU na fronteira fs: `exists()` disse sim, `stat()` nega logo
+    # depois -- so o campo claudeMd degrada, o resto do snapshot sai inteiro.
+    _patched(monkeypatch, ["node"])
+    home = _home(tmp_path)
+    claude_md = home / ".claude" / "CLAUDE.md"
+    real_stat = Path.stat
+    real_exists = Path.exists
+
+    def stat(self, *args, **kw):
+        if self == claude_md:
+            raise PermissionError(13, "negada")
+        return real_stat(self, *args, **kw)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    monkeypatch.setattr(
+        Path, "exists",
+        lambda self: True if self == claude_md else real_exists(self))
+    s = envreport.snapshot(entry_path=Path("thero.py"), home=home,
+                           config_path=tmp_path / ".thero" / "config.json")
+    assert s["claudeMd"] == {"exists": False, "bytes": 0, "backups": 0}
+    assert s["skills"]["installed"] == 1
+
+
+def test_nonzero_exit_with_clean_stdout_is_not_ok(monkeypatch):
+    # Fim da adivinhacao pelo texto: exit != 0 imprimindo saida "limpa"
+    # reporta ok False porque o sucesso vem do returncode real.
+    class Result:
+        returncode = 3
+        stdout = "Thero wrapper pronto"
+        stderr = ""
+
+    monkeypatch.setattr(envreport, "run_command", lambda cmd, **kw: Result())
+    assert envreport._version_probe(["claude"]) == ("Thero wrapper pronto", False)
 
 
 def test_ollama_absent_is_up_false_with_host(tmp_path, monkeypatch):
@@ -724,6 +842,28 @@ def test_first_run_counts_and_fixed_command_name(tmp_path, monkeypatch):
     assert s["claudeMd"]["bytes"] == 40
     assert s["commandName"] == "thero"       # nome fixo, nunca editavel
     assert s["scope"] == "global"
+
+
+def test_env_block_alone_does_not_count_as_installed_command(tmp_path):
+    # A Task 5 escreve o bloco de ENV no MESMO $PROFILE e o bloco cita
+    # "thero"; a checagem casa o marcador do comando global, nao substring.
+    profile = tmp_path / "profile.ps1"
+    profile.write_text(
+        "%s\n$env:THERO_OLLAMA_MODEL = 'thero-local'\n%s\n"
+        % (ENV_MARKER_START, ENV_MARKER_END),
+        encoding="utf-8",
+    )
+    assert envreport._command_installed(profile) is False
+
+
+def test_command_marker_in_profile_counts_as_installed(tmp_path):
+    profile = tmp_path / "profile.ps1"
+    profile.write_text(
+        "%s\nfunction thero { python thero.py }\n%s\n"
+        % (COMMAND_MARKER_START, COMMAND_MARKER_END),
+        encoding="utf-8",
+    )
+    assert envreport._command_installed(profile) is True
 
 
 def test_config_present_flips_first_run(tmp_path, monkeypatch):
@@ -788,10 +928,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 from thero import config as config_store
-from thero.settings import DEFAULT_COMMAND_NAME
+from thero.settings import COMMAND_MARKER_START, DEFAULT_COMMAND_NAME
 from thero.system.process import run_command
 
 _TOOLS = ("node", "npx", "claude", "git")
@@ -800,22 +940,32 @@ _TOOLS = ("node", "npx", "claude", "git")
 # teto congela a janela inteira.
 VERSION_TIMEOUT = 10
 
+# Idem para o spawn `powershell -Command $PROFILE` da sonda de perfil: filho
+# no mesmo loop, mesmo teto obrigatorio.
+PROFILE_TIMEOUT = 5
+
 
 def _which(name: str) -> Optional[str]:
     return shutil.which(name)
 
 
-def _first_line(command: list) -> str:
-    """Primeira linha nao vazia de `<cmd> --version` ('' se silenciar ou travar)."""
+def _version_probe(command: list) -> tuple:
+    """(primeira linha nao vazia, ok) de `<cmd> --version`.
+
+    `ok` vem do returncode real, nao do texto: ferramenta que sai com erro
+    imprimindo saida "limpa" continua nao-ok ('' e False se silenciar ou
+    travar).
+    """
     try:
         result = run_command(command + ["--version"], timeout=VERSION_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return ""
-    out = (result.stdout or "") if result.returncode == 0 else (result.stderr or "")
+        return "", False
+    ok = result.returncode == 0
+    out = (result.stdout or "") if ok else (result.stderr or result.stdout or "")
     for line in out.splitlines():
         if line.strip():
-            return line.strip()
-    return ""
+            return line.strip(), ok
+    return "", False
 
 
 def _ollama_probe() -> dict:
@@ -835,10 +985,12 @@ def _ollama_probe() -> dict:
 def _profile_path() -> Optional[Path]:
     if platform.system() != "Windows":
         return None
-    from thero.shell_command.windows import resolve_powershell_profile
-
     try:
-        return resolve_powershell_profile()
+        # Import dentro da fronteira protegida: modulo quebrado degrada so
+        # este campo, nunca o payload inteiro da tela de Status.
+        from thero.shell_command.windows import resolve_powershell_profile
+
+        return resolve_powershell_profile(timeout=PROFILE_TIMEOUT)
     except Exception:  # noqa: BLE001 - conforto, nunca motivo de falha na GUI
         return None
 
@@ -850,14 +1002,22 @@ def _command_installed(profile: Optional[Path]) -> bool:
         text = Path(profile).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
-    return DEFAULT_COMMAND_NAME in text
+    # Casa o marcador exato que o instalador do comando global escreve --
+    # nunca a substring "thero": o bloco de ENV da Task 5 vive no mesmo
+    # $PROFILE e cita o nome.
+    return COMMAND_MARKER_START in text
 
 
 def _count_skills(skills_base: Path) -> int:
-    if not skills_base.is_dir():
+    # Fronteira fs: is_dir()/iterdir() podem negar (PermissionError) -- a
+    # contagem degrada a 0 e o snapshot continua de pe.
+    try:
+        if not skills_base.is_dir():
+            return 0
+        return sum(1 for folder in sorted(skills_base.iterdir())
+                   if folder.is_dir() and (folder / "SKILL.md").exists())
+    except OSError:
         return 0
-    return sum(1 for folder in sorted(skills_base.iterdir())
-               if folder.is_dir() and (folder / "SKILL.md").exists())
 
 
 def snapshot(
@@ -880,16 +1040,14 @@ def snapshot(
         ok = False
         if found:
             try:
-                line = _first_line([name])
+                line, ok = _version_probe([name])
             except Exception as exc:  # noqa: BLE001 - fronteira: nunca derrubar a GUI
                 line = ""
                 detail = str(exc)
-            if line.lower().startswith("error"):
-                detail = line
-            elif line:
-                ok = True
+            if line:
                 detail = line
             else:
+                ok = False
                 detail = detail or "sem saida de --version"
         tools[name] = {"found": found, "ok": ok, "detail": detail}
 
@@ -898,9 +1056,16 @@ def snapshot(
     except Exception as exc:  # noqa: BLE001
         ollama = {"up": False, "host": "", "models": [], "error": str(exc)}
 
-    exists = claude_md.exists()
-    md_bytes = claude_md.stat().st_size if exists else 0
-    backups = sorted(claude_dir.glob("CLAUDE.md.backup*")) if claude_dir.is_dir() else []
+    try:
+        exists = claude_md.exists()
+        md_bytes = claude_md.stat().st_size if exists else 0
+    except OSError:  # fronteira fs: degrada so o campo claudeMd
+        exists, md_bytes = False, 0
+    try:
+        backups = (sorted(claude_dir.glob("CLAUDE.md.backup*"))
+                   if claude_dir.is_dir() else [])
+    except OSError:  # idem: so o contador de backups degrada
+        backups = []
     profile = _profile_path()
 
     return {
@@ -925,15 +1090,38 @@ def snapshot(
     }
 ```
 
+**3c — teto na sonda do `$PROFILE`** (Modify: `src/thero/shell_command/windows.py:14-34`).
+`resolve_powershell_profile` da um spawn de PowerShell; quando a ponte o chama
+via `envreport._profile_path`, vale a mesma logica da 3a: sem teto, um
+PowerShell pendurado congela o loop de stdio inteiro. Quem nao passa `timeout`
+(instalador de comando) continua com o comportamento de hoje (`None` = sem
+limite):
+
+```python
+def resolve_powershell_profile(timeout: float | None = None) -> Path | None:
+
+    result = run_command(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "$PROFILE",
+        ],
+        capture=True,
+        timeout=timeout,
+    )
+```
+
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `261 + 8 = 269 passed`
+Expected: `261 + 15 = 276 passed`
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
 ```bash
-git add src/thero/envreport.py src/thero/system/process.py tests/test_envreport.py
+git add src/thero/envreport.py src/thero/system/process.py \
+        src/thero/shell_command/windows.py tests/test_envreport.py
 git commit -m "feat(env): structured environment snapshot for the Status screen and onboarding"
 ```
 
@@ -1256,7 +1444,7 @@ def status(base: str = "") -> dict:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `269 + 8 = 277 passed`
+Expected: `276 + 8 = 284 passed`
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -1606,7 +1794,7 @@ def blank_from_preset(pid: str, label: str = "") -> dict:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `277 + 13 = 290 passed`
+Expected: `284 + 13 = 297 passed`
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -2206,7 +2394,7 @@ def apply_all(cfg: dict, paths: dict,
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `290 + 18 = 308 passed` (os testes antigos do comando global cobrem o `upsert_marked_block` delegado e continuam passando)
+Expected: `297 + 18 = 315 passed` (os testes antigos do comando global cobrem o `upsert_marked_block` delegado e continuam passando)
 
 - [ ] **Step 6: Commit (pedir confirmação)**
 
@@ -2590,7 +2778,7 @@ def save_manifest(manifest: dict, path: Optional[Path] = None) -> Path:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `308 + 13 = 321 passed`
+Expected: `315 + 13 = 328 passed`
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -2791,7 +2979,7 @@ reatribuição por:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `321 + 6 = 327 passed` (os testes que cobriam `run_command` continuam passando — comportamento externo inalterado)
+Expected: `328 + 6 = 334 passed` (os testes que cobriam `run_command` continuam passando — comportamento externo inalterado)
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -3678,7 +3866,7 @@ Acrescentar ao `HELP_EPILOG_TEMPLATE`, na seção COMANDOS:
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `327 + 30 = 357 passed`
+Expected: `334 + 30 = 364 passed`
 
 - [ ] **Step 6: Smoke manual do protocolo (sem UI)**
 
@@ -5132,7 +5320,7 @@ def test_the_bridge_command_list_matches_the_ui_vocabulary():
 - [ ] **Step 2: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `357 + 7 = 364 passed`
+Expected: `364 + 7 = 371 passed`
 
 - [ ] **Step 3: Smoke manual da janela**
 
