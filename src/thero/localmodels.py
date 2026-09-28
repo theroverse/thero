@@ -4,7 +4,7 @@ Contrato verificado na máquina: os consumidores são dois, cada um com seu par
 de variáveis -- a Athena lê `ATHENA_OLLAMA_HOST` / `ATHENA_OLLAMA_MODEL`
 (athena/src/athena/settings.py:52-72, default http://localhost:11434) e o
 Sentinel lê `SENTINEL_OLLAMA_HOST` / `SENTINEL_OLLAMA_MODEL`
-(sentinel/src/sentinel/settings.py:255-279, default http://127.0.0.1:11434 +
+(sentinel/src/sentinel/settings.py:255-283, default http://127.0.0.1:11434 +
 qwen3-coder-next, com veto de host fora de loopback). Os dois só consomem:
 nada aqui instala motor -- o Thero escreve onde apontar.
 
@@ -22,7 +22,11 @@ import urllib.request
 from typing import Iterator, Optional
 from urllib.parse import urlparse
 
-from thero.settings import OLLAMA_DEFAULT_HOST, OLLAMA_PROBE_TIMEOUT
+from thero.settings import (
+    OLLAMA_DEFAULT_HOST,
+    OLLAMA_PROBE_TIMEOUT,
+    OLLAMA_PULL_TIMEOUT,
+)
 
 # Dependencia injetavel nos testes; o nome `urlopen` e usado modulo-afora
 # de proposito para o monkeypatch funcionar.
@@ -73,6 +77,15 @@ def _describe(error: Exception) -> str:
     return text
 
 
+def _size_of(item: dict) -> int:
+    # Tamanho e informativo: um valor malformado ("abc", None, lista) nao pode
+    # derrubar a listagem inteira -- cai para 0 e o sizeHuman vira "-".
+    try:
+        return int(item.get("size") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def list_models(base: str = "") -> dict:
     url = _guard(base) + "/api/tags"
     # Request com method explicito: o contrato de rede e sempre um objeto
@@ -88,15 +101,27 @@ def list_models(base: str = "") -> dict:
         # humano, nunca com AttributeError no meio do payload da ponte.
         return {"ok": False, "models": [],
                 "error": "resposta inesperada do Ollama (/api/tags)"}
+    # Mesma fronteira logo abaixo: {"models": <nao-list>} iteraria as chaves/
+    # letras como se fossem modelos. Lista e o unico formato aceito; chave
+    # ausente e o caso legitimo de "nenhum modelo instalado".
+    raw_models = payload.get("models") or []
+    if not isinstance(raw_models, list):
+        return {"ok": False, "models": [],
+                "error": "resposta inesperada do Ollama (/api/tags)"}
     models = []
-    for item in payload.get("models", []):
-        size = int(item.get("size") or 0)
+    for item in raw_models:
+        # Item que nao seja objeto entra com valores vazios, sem excecao.
+        entry = item if isinstance(item, dict) else {}
+        details = entry.get("details")
+        if not isinstance(details, dict):
+            details = {}
+        size = _size_of(entry)
         models.append({
-            "name": item.get("name", ""),
+            "name": entry.get("name", ""),
             "size": size,
             "sizeHuman": human_bytes(size),
-            "params": (item.get("details") or {}).get("parameter_size", ""),
-            "family": (item.get("details") or {}).get("family", ""),
+            "params": details.get("parameter_size", ""),
+            "family": details.get("family", ""),
         })
     return {"ok": True, "models": models, "error": ""}
 
@@ -110,8 +135,11 @@ def human_bytes(size: int) -> str:
 def pull(name: str, base: str = "") -> Iterator[tuple]:
     """Gera ('out', linha) durante o download e ('exit', codigo) no fim.
 
-    O formato e o mesmo de system.process.stream_command, para a ponte tratar
-    `ollama pull` e `npx skills` no mesmo painel de terminal.
+    A resposta e lida INCREMENTALMENTE -- iterar o HTTPResponse em linhas,
+    nao read() do corpo inteiro -- senao nenhum ('out', linha) chega antes
+    de o download acabar e a tela de progresso nao tem o que mostrar.
+    O formato e o mesmo de system.process.stream_command, para a ponte
+    tratar `ollama pull` e `npx skills` no mesmo painel de terminal.
     """
     url = _guard(base) + "/api/pull"
     if not name:
@@ -124,32 +152,35 @@ def pull(name: str, base: str = "") -> Iterator[tuple]:
         method="POST",
     )
     try:
-        # timeout SEMPRE como keyword e nunca None (sem teto, um
-        # `ollama pull` que pendura congela o loop stdio da ponte). O corpo
-        # e lido inteiro com read() e cortado em linhas -- a resposta NAO e
-        # iteravel neste caminho.
-        with urlopen(request, timeout=OLLAMA_PROBE_TIMEOUT) as response:
-            payload = response.read()
+        # timeout SEMPRE como keyword e nunca None (sem teto, um `ollama pull`
+        # que pendura congela o loop stdio da ponte). O teto aqui e o do pull,
+        # NAO o da sonda: e leitura por operacao, nao duracao total -- as
+        # fases `verifying sha256`/`writing blob` passam minutos sem emitir
+        # bytes, e 3 s de silencio abortariam um download de varios GB.
+        with urlopen(request, timeout=OLLAMA_PULL_TIMEOUT) as response:
+            # HTTPResponse e iteravel em linhas: o corte incremental e o que
+            # faz os eventos chegarem DURANTE o download.
+            for raw in response:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    yield ("out", line)
+                    continue
+                if not isinstance(event, dict):
+                    # JSON atomico solto na stream ("123", "ok"): vira
+                    # saida crua, nao AttributeError que escaparia pela
+                    # geradora afora.
+                    yield ("out", line)
+                    continue
+                text = event.get("status") or event.get("error") or line
+                yield ("out", text)
     except (urllib.error.URLError, OSError) as exc:
         yield ("out", _describe(exc))
         yield ("exit", 1)
         return
-    for raw in payload.split(b"\n"):
-        line = raw.decode("utf-8", "replace").strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except ValueError:
-            yield ("out", line)
-            continue
-        if not isinstance(event, dict):
-            # JSON atomico solto na stream ("123", "ok"): vira saida crua,
-            # nao AttributeError que escaparia pela geradora afora.
-            yield ("out", line)
-            continue
-        text = event.get("status") or event.get("error") or line
-        yield ("out", text)
     yield ("exit", 0)
 
 

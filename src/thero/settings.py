@@ -36,7 +36,7 @@ SKILLS_QUARANTINE_DIRNAME = "skills"
 
 # Bloco de ambiente no $PROFILE: e como ATHENA_OLLAMA_HOST/MODEL (athena/src/
 # athena/settings.py) e SENTINEL_OLLAMA_HOST/MODEL (sentinel/src/sentinel/
-# settings.py:205-243) chegam de fato a qualquer processo lancado do terminal.
+# settings.py:255-283) chegam de fato a qualquer processo lancado do terminal.
 # Marcadores proprios, diferentes dos do
 # comando global, para um upsert nao comer o outro.
 ENV_MARKER_START = "# >>> thero env >>>"
@@ -47,3 +47,8 @@ ENV_MARKER_END = "# <<< thero env <<<"
 OLLAMA_DEFAULT_HOST = "http://127.0.0.1:11434"
 
 OLLAMA_PROBE_TIMEOUT = 3
+
+# Teto de leitura POR OPERACAO do `ollama pull` (timeout de socket em cada
+# read, nao a duracao total do download): um modelo de varios GB passa pelas
+# fases `verifying sha256`/`writing blob` sem emitir bytes por minutos.
+OLLAMA_PULL_TIMEOUT = 1800

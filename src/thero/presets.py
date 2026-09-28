@@ -237,6 +237,6 @@ def default_agents() -> list:
 def default_routing() -> dict:
     # Cada slot comeca com o padrao que aquele proprio consumidor ja usa no
     # codigo dele: Athena = llama3.2 (athena/src/athena/settings.py), Sentinel
-    # = qwen3-coder-next (sentinel/src/sentinel/settings.py:228).
+    # = qwen3-coder-next (sentinel/src/sentinel/settings.py:276).
     return {"mode": "zeus", "athena": "llama3.2",
             "sentinel": "qwen3-coder-next", "fallback": "Claude Code"}
