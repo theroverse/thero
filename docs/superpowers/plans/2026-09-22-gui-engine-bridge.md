@@ -1345,6 +1345,16 @@ def test_pull_streams_lines_then_exits(monkeypatch):
     assert response.served == 2
     assert response.served < len(response._lines)
     assert response.read_calls == 0
+    # Contrato completo, consumido ate o fim numa segunda chamada: cada linha
+    # NDJSON vira ('out', status) e o ultimo evento e sempre ('exit', 0).
+    full = list(localmodels.pull("llama3.2", base="http://127.0.0.1:11434"))
+    assert full == [
+        ("out", "downloading 0%"),
+        ("out", "downloading 50%"),
+        ("out", "downloading 100%"),
+        ("out", "success"),
+        ("exit", 0),
+    ]
     # timeout SEMPRE como keyword e nunca None: pull pendurado nao congela
     # o loop stdio da ponte
     call = fake.calls[0]
