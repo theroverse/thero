@@ -16,7 +16,9 @@ vive no processo da ponte, cujo stdout é o canal JSON.
 
 from __future__ import annotations
 
+import http.client
 import json
+import re
 import urllib.error
 import urllib.request
 from typing import Iterator, Optional
@@ -24,6 +26,7 @@ from urllib.parse import urlparse
 
 from thero.settings import (
     OLLAMA_DEFAULT_HOST,
+    OLLAMA_DELETE_TIMEOUT,
     OLLAMA_PROBE_TIMEOUT,
     OLLAMA_PULL_TIMEOUT,
 )
@@ -32,11 +35,22 @@ from thero.settings import (
 # de proposito para o monkeypatch funcionar.
 urlopen = urllib.request.urlopen
 
-_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+# O netloc COMPLETO pelo qual o http.client conecta (host + porta opcional),
+# nao so o hostname do urlparse: ele corta no PRIMEIRO ":", o http.client
+# conecta no ULTIMO -- "http://localhost:11434.evil.com" passaria num teste
+# de hostname e conectaria em outro host. Colchetes sao a forma IPv6 da URL.
+_LOOPBACK_NETLOC = re.compile(
+    r"(\[?(127\.0\.0\.1|localhost|::1)\]?)(:[0-9]{1,5})?", re.IGNORECASE
+)
 
 
 def normalize_base(host: Optional[str] = "") -> str:
-    """Aceita '127.0.0.1:11434', 'localhost' ou URL completa; devolve URL."""
+    """Aceita '127.0.0.1:11434', 'localhost' ou URL completa; devolve URL.
+
+    Descarta APENAS a "/" final -- escolha documentada nos testes: os
+    endpoints locais pedem uma base seca, e path/query/fragment que
+    sobrarem fazem o _assert_loopback recusar.
+    """
     raw = (host or OLLAMA_DEFAULT_HOST).strip()
     if not raw:
         raw = OLLAMA_DEFAULT_HOST
@@ -46,13 +60,17 @@ def normalize_base(host: Optional[str] = "") -> str:
 
 
 def _assert_loopback(base: str) -> str:
-    # Comparacao EXATA de hostname: startswith/substring e o bypass classico
-    # de http://localhost.evil.com:11434 .
-    host = (urlparse(base).hostname or "").lower()
-    if host not in _LOOPBACK:
+    parsed = urlparse(base)
+    # O userinfo (ate o ULTIMO "@") nao participa da conexao; o resto do
+    # netloc sim, e por isso ele e validado inteiro.
+    hostinfo = parsed.netloc.rpartition("@")[2]
+    parsed.port  # dentro do veto: ValueError se a porta nao for 0..65535
+    if _LOOPBACK_NETLOC.fullmatch(hostinfo) is None or (
+        parsed.path or parsed.params or parsed.query or parsed.fragment
+    ):
         raise ValueError(
             "apenas loopback e permitido para modelos locais "
-            "(recebi %r)" % (host or base)
+            "(recebi %r)" % (base,)
         )
     return base
 
@@ -64,17 +82,23 @@ def _guard(base: str) -> str:
     return _assert_loopback(normalize_base(base))
 
 
-def _describe(error: Exception) -> str:
+def _describe(error: Exception, base: str) -> str:
     if isinstance(error, urllib.error.HTTPError):
-        return "HTTP %d %s" % (error.code, error.reason)
+        return "HTTP %d %s" % (error.code, error.reason or "")
     reason = getattr(error, "reason", None) or error
-    text = str(reason)
-    if "refused" in text.lower():
-        return (
-            "Ollama nao respondeu (conexao recusada em %s). "
-            "Ele esta rodando?" % text
-        )
-    return text
+    # Recusa detectada por TIPO/errno, nao pela substring inglesa "refused":
+    # no Windows a razao chega "[WinError 10061] Nenhuma conexao pudo ser
+    # feita..." e o ramo nunca dispararia.
+    refused = (
+        isinstance(reason, ConnectionRefusedError)
+        or getattr(reason, "errno", None) == 10061
+        or getattr(reason, "winerror", None) == 10061
+        or "refused" in str(reason).lower()
+    )
+    if refused:
+        # Cita o HOST, nunca a razao crua do SO dentro da frase.
+        return "conexao recusada em %s: o Ollama esta rodando?" % base
+    return str(reason)
 
 
 def _size_of(item: dict) -> int:
@@ -86,16 +110,29 @@ def _size_of(item: dict) -> int:
         return 0
 
 
-def list_models(base: str = "") -> dict:
-    url = _guard(base) + "/api/tags"
-    # Request com method explicito: o contrato de rede e sempre um objeto
-    # Request (nunca string crua), igual a pull/delete.
-    request = urllib.request.Request(url, method="GET")
+def human_bytes(size: int) -> str:
+    if size <= 0:
+        return "-"
+    if size < 1024 ** 3:
+        # Abaixo de 1 GB o "0.0 GB" seria lido como modelo vazio na tela.
+        return "%.0f MB" % (size / 1024.0 ** 2)
+    return "%.1f GB" % (size / 1024.0 ** 3)
+
+
+def _fetch_tags(url_base: str) -> dict:
+    # Caminho de rede UNICO do /api/tags: list_models e status o dividem para
+    # o veto/parse nao ser duplicado. Request com method explicito: o contrato
+    # de rede e sempre um objeto Request (nunca string crua), igual a pull.
+    request = urllib.request.Request(url_base + "/api/tags", method="GET")
     try:
         with urlopen(request, timeout=OLLAMA_PROBE_TIMEOUT) as response:
             payload = json.loads(response.read().decode("utf-8", "replace"))
-    except (urllib.error.URLError, ValueError, OSError) as exc:
-        return {"ok": False, "models": [], "error": _describe(exc)}
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        # OSError ja cobre socket E urllib.error.URLError/HTTPError (os dois
+        # herdam dele); HTTPException cobre o http.client que escapa do
+        # OSError (BadStatusLine de servico nao-HTTP na 11434, IncompleteRead
+        # no meio do corpo); ValueError so existe aqui pelo json.loads.
+        return {"ok": False, "models": [], "error": _describe(exc, url_base)}
     if not isinstance(payload, dict):
         # JSON valido, mas nao o objeto esperado: a tela degrada com erro
         # humano, nunca com AttributeError no meio do payload da ponte.
@@ -126,31 +163,38 @@ def list_models(base: str = "") -> dict:
     return {"ok": True, "models": models, "error": ""}
 
 
-def human_bytes(size: int) -> str:
-    if size <= 0:
-        return "-"
-    return "%.1f GB" % (size / 1024.0 ** 3)
+def list_models(base: str = "") -> dict:
+    return _fetch_tags(_guard(base))
 
 
 def pull(name: str, base: str = "") -> Iterator[tuple]:
     """Gera ('out', linha) durante o download e ('exit', codigo) no fim.
 
-    A resposta e lida INCREMENTALMENTE -- iterar o HTTPResponse em linhas,
-    nao read() do corpo inteiro -- senao nenhum ('out', linha) chega antes
-    de o download acabar e a tela de progresso nao tem o que mostrar.
-    O formato e o mesmo de system.process.stream_command, para a ponte
-    tratar `ollama pull` e `npx skills` no mesmo painel de terminal.
+    NAO e geradora pura: o veto roda na CHAMADA, antes de alguem iterar --
+    um pull remoto nunca consumido nao pode ficar ileso. A resposta e lida
+    INCREMENTALMENTE -- iterar o HTTPResponse em linhas, nao read() do corpo
+    inteiro -- senao nenhum ('out', linha) chega antes de o download acabar
+    e a tela de progresso nao tem o que mostrar. O formato ('out', str) /
+    ('exit', int) e o que a ponte promete expor como
+    `system.process.stream_command` (contrato PLANEJADO da Task 7; o modulo
+    ainda nao existe) para tratar `ollama pull` e `npx skills` no mesmo
+    painel de terminal.
     """
-    url = _guard(base) + "/api/pull"
+    return _pull(name, _guard(base))
+
+
+def _pull(name: str, url_base: str) -> Iterator[tuple]:
     if not name:
         yield ("out", "informe o nome do modelo")
         yield ("exit", 2)
         return
     body = json.dumps({"name": name, "stream": True}).encode("utf-8")
     request = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"},
-        method="POST",
+        url_base + "/api/pull", data=body,
+        headers={"Content-Type": "application/json"}, method="POST",
     )
+    failed = False
+    saw_event = False
     try:
         # timeout SEMPRE como keyword e nunca None (sem teto, um `ollama pull`
         # que pendura congela o loop stdio da ponte). O teto aqui e o do pull,
@@ -158,8 +202,6 @@ def pull(name: str, base: str = "") -> Iterator[tuple]:
         # fases `verifying sha256`/`writing blob` passam minutos sem emitir
         # bytes, e 3 s de silencio abortariam um download de varios GB.
         with urlopen(request, timeout=OLLAMA_PULL_TIMEOUT) as response:
-            # HTTPResponse e iteravel em linhas: o corte incremental e o que
-            # faz os eventos chegarem DURANTE o download.
             for raw in response:
                 line = raw.decode("utf-8", "replace").strip()
                 if not line:
@@ -175,27 +217,47 @@ def pull(name: str, base: str = "") -> Iterator[tuple]:
                     # geradora afora.
                     yield ("out", line)
                     continue
-                text = event.get("status") or event.get("error") or line
-                yield ("out", text)
-    except (urllib.error.URLError, OSError) as exc:
-        yield ("out", _describe(exc))
+                saw_event = True
+                # docs.ollama.com/api/errors: o erro de stream chega como
+                # evento {"error": ...} SEM mudar o status HTTP. Linha de
+                # progresso comum aqui daria exit 0 a um download quebrado,
+                # e a tela verde entregaria o modelo ao motor na Task 5.
+                if event.get("error"):
+                    failed = True
+                    yield ("out", str(event["error"]))
+                    continue
+                yield ("out", event.get("status") or line)
+            if getattr(response, "length", 0):
+                # Servidor com Content-Length que corta o corpo no meio:
+                # iterar nao levanta em EOF antecipado -- so o length
+                # residual denuncia o truncamento.
+                failed = True
+                yield ("out", "resposta truncada pelo Ollama "
+                              "(download incompleto)")
+    except (OSError, http.client.HTTPException) as exc:
+        yield ("out", _describe(exc, url_base))
         yield ("exit", 1)
         return
-    yield ("exit", 0)
+    # Stream vazia (nenhum evento valido) nao afirma nada sobre o download:
+    # exit 1 -- a ponte nao pode marcar verde sem manifest.
+    yield ("exit", 1 if (failed or not saw_event) else 0)
 
 
 def delete(name: str, base: str = "") -> dict:
-    url = _guard(base) + "/api/delete"
+    url_base = _guard(base)
     body = json.dumps({"name": name}).encode("utf-8")
     request = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"},
-        method="DELETE",
+        url_base + "/api/delete", data=body,
+        headers={"Content-Type": "application/json"}, method="DELETE",
     )
     try:
-        with urlopen(request, timeout=OLLAMA_PROBE_TIMEOUT) as response:
-            response.read()
-    except (urllib.error.URLError, OSError) as exc:
-        return {"ok": False, "error": _describe(exc)}
+        # delete e mutacao, nao sonda: o /api/delete faz unlink de blobs de
+        # GB e os 3 s da sonda reportariam falha num apagamento realizado.
+        with urlopen(request, timeout=OLLAMA_DELETE_TIMEOUT) as response:
+            response.read()  # drena o corpo: o IncompleteRead aparece
+                             # DENTRO do try, nao no close() implicito
+    except (OSError, http.client.HTTPException) as exc:
+        return {"ok": False, "error": _describe(exc, url_base)}
     return {"ok": True, "error": ""}
 
 
@@ -206,7 +268,7 @@ def status(base: str = "") -> dict:
     `up`, `base`, `models`, `error` -- exatamente as que ele le.
     """
     url_base = _guard(base)
-    out = list_models(url_base)
+    out = _fetch_tags(url_base)
     return {
         "up": bool(out["ok"]),
         "base": url_base,

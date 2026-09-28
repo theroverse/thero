@@ -4,7 +4,9 @@ O Ollama nao esta instalado nesta maquina e mesmo assim estivesse, a suíte
 não pode depender dele: tudo passa pelo FakeUrlopen via monkeypatch.
 """
 
+import http.client
 import json
+import urllib.error
 
 import pytest
 
@@ -14,9 +16,11 @@ from thero import localmodels
 class FakeResponse:
     """Corpo inteiro via read() E iteravel em linhas -- os dois contratos do
     `http.client.HTTPResponse` real. `served`/`read_calls` existem para o teste
-    provar que o pull consome linha a linha em vez de slurpar o corpo."""
+    provar que o pull consome linha a linha em vez de slurpar o corpo, e
+    `length` espelha os bytes QUE FALTAM no corpo: num servidor com
+    Content-Length cortado no meio e o unico sinal de truncamento."""
 
-    def __init__(self, payload):
+    def __init__(self, payload, length=0):
         self._payload = payload
         parts = payload.split(b"\n")
         # Corte so em b"\n", igual ao readline() do HTTPResponse real (que nao
@@ -26,6 +30,7 @@ class FakeResponse:
             self._lines.append(parts[-1])
         self.served = 0
         self.read_calls = 0
+        self.length = length
 
     def read(self):
         self.read_calls += 1
@@ -43,6 +48,23 @@ class FakeResponse:
         return False
 
 
+class ExplodingResponse(FakeResponse):
+    """Entrega `after` linhas e ai levanta `exc` -- o IncompleteRead no meio
+    da stream que um HTTPResponse real da quando o servidor derruba o socket
+    durante um pull de varios GB, depois de o consumidor ja ter visto linhas."""
+
+    def __init__(self, payload, exc, after=1):
+        FakeResponse.__init__(self, payload)
+        self._exc = exc
+        self._after = after
+
+    def __iter__(self):
+        for raw in FakeResponse.__iter__(self):
+            if self.served > self._after:
+                raise self._exc
+            yield raw
+
+
 class FakeUrlopen:
     """Registra o que foi chamado e devolve o corpo pedido.
 
@@ -52,14 +74,19 @@ class FakeUrlopen:
     provar que nenhum `ollama pull` pendurado trava o loop da ponte.
 
     Guarda cada resposta em `responses` para o teste do pull poder contar
-    quantas linhas do corpo foram de fato consumidas.
+    quantas linhas do corpo foram de fato consumidas. `response=` injeta um
+    FakeResponse pronto (o ExplodingResponse) e `length=` simula o corpo
+    truncado com bytes residuais.
     """
 
-    def __init__(self, body=b'{"models": []}', error=None):
+    def __init__(self, body=b'{"models": []}', error=None, response=None,
+                 length=0):
         self.calls = []
         self.responses = []
         self.body = body
         self.error = error
+        self.response = response
+        self.length = length
 
     def __call__(self, request, timeout=None):
         self.calls.append({
@@ -70,7 +97,9 @@ class FakeUrlopen:
         })
         if self.error:
             raise self.error
-        response = FakeResponse(self.body)
+        response = self.response
+        if response is None:
+            response = FakeResponse(self.body, length=self.length)
         self.responses.append(response)
         return response
 
@@ -97,17 +126,23 @@ def test_list_models_reads_the_ollama_tags_endpoint(monkeypatch):
     assert fake.calls[0]["method"] == "GET"
 
 
-def test_a_refused_port_reports_down_instead_of_raising(monkeypatch):
-    import urllib.error
-
-    monkeypatch.setattr(
-        localmodels, "urlopen",
-        FakeUrlopen(error=urllib.error.URLError("connection refused")),
-    )
+@pytest.mark.parametrize("error", [
+    # A recusa em ingles (Linux/POSIX) e a variante PT-BR do Windows com o
+    # MESMO errno 10061: o ramo de "conexao recusada" nao pode depender de
+    # substring inglesa, que nunca dispara na lingua desta maquina.
+    urllib.error.URLError("connection refused"),
+    urllib.error.URLError(ConnectionRefusedError(
+        10061, "Nenhuma conexão pôde ser feita")),
+])
+def test_a_refused_port_reports_down_instead_of_raising(error, monkeypatch):
+    monkeypatch.setattr(localmodels, "urlopen", FakeUrlopen(error=error))
     out = localmodels.list_models("http://127.0.0.1:11434")
     assert out["ok"] is False
     assert out["models"] == []
-    assert "recusado" in out["error"] or "refused" in out["error"]
+    # A mensagem cita o HOST, nao a razao crua do SO despejada na frase.
+    assert "recusada" in out["error"]
+    assert "127.0.0.1:11434" in out["error"]
+    assert "refused" not in out["error"]
 
 
 def test_list_models_survives_a_non_list_models_field(monkeypatch):
@@ -134,26 +169,42 @@ def test_list_models_coerces_a_broken_size_to_zero(monkeypatch):
                               "params": "", "family": ""}]
 
 
-def test_only_loopback_is_ever_contacted(monkeypatch):
+@pytest.mark.parametrize("bad", [
+    # Os quatro originais: host remoto puro.
+    "http://10.0.0.5:11434",
+    "https://ollama.example.com",
+    "http://[fe80::1]:11434",
+    "http://localhost.evil.com:11434",
+    # urlparse().hostname corta no PRIMEIRO ":", o http.client conecta no
+    # ULTIMO: estes passam num teste de hostname e mudam de host/porta.
+    "http://localhost:11434.evil.com",
+    "http://localhost:11434.evil.com:80",
+    "http://127.0.0.1:11434:80",
+    # fragmento com host venenoso e path sobrando depois do host.
+    "http://localhost#@evil.com",
+    "http://127.0.0.1:11434/../",
+])
+def test_only_loopback_is_ever_contacted(bad, monkeypatch):
     fake = FakeUrlopen()
     monkeypatch.setattr(localmodels, "urlopen", fake)
-    for bad in ("http://10.0.0.5:11434", "https://ollama.example.com",
-                "http://[fe80::1]:11434", "http://localhost.evil.com:11434"):
-        with pytest.raises(ValueError):
-            localmodels.list_models(bad)
-        with pytest.raises(ValueError):
-            localmodels.status(bad)
-        with pytest.raises(ValueError):
-            localmodels.delete("llama3.2", base=bad)
-        with pytest.raises(ValueError):
-            list(localmodels.pull("llama3.2", base=bad))
+    with pytest.raises(ValueError):
+        localmodels.list_models(bad)
+    with pytest.raises(ValueError):
+        localmodels.status(bad)
+    with pytest.raises(ValueError):
+        localmodels.delete("llama3.2", base=bad)
+    with pytest.raises(ValueError):
+        list(localmodels.pull("llama3.2", base=bad))
     # o veto dispara antes de qualquer rede: nenhuma chamada chegou ao fake
     assert fake.calls == []
 
 
 def test_loopback_spellings_are_all_accepted():
+    # A "/" final e aceita porque normalize_base a descarta ANTES do veto;
+    # qualquer outro path/query/fragment (ver BAD_BASES acima) e recusa.
     for good in ("http://127.0.0.1:11434", "http://localhost:11434",
-                 "http://[::1]:11434", "localhost:11434"):
+                 "http://[::1]:11434", "localhost:11434",
+                 "http://localhost:11434/", "http://LOCALHOST:11434"):
         base = localmodels.normalize_base(good)
         assert localmodels._assert_loopback(base) == base
 
@@ -201,8 +252,6 @@ def test_pull_streams_lines_then_exits(monkeypatch):
 
 
 def test_pull_failure_becomes_exit_1_not_an_exception(monkeypatch):
-    import urllib.error
-
     monkeypatch.setattr(
         localmodels, "urlopen",
         FakeUrlopen(error=urllib.error.HTTPError(
@@ -213,15 +262,143 @@ def test_pull_failure_becomes_exit_1_not_an_exception(monkeypatch):
     assert events[-1][1] == 1
 
 
+def test_pull_reports_stream_error_as_exit_1(monkeypatch):
+    # docs.ollama.com/api/errors: o erro de stream chega como evento
+    # {"error": ...} SEM mudar o status HTTP. Tratado como linha comum, o
+    # exit 0 entregaria um modelo inexistente para ATHENA_OLLAMA_MODEL.
+    body = b'{"error": "pull failed: could not connect to registry"}\n'
+    fake = FakeUrlopen(body)
+    monkeypatch.setattr(localmodels, "urlopen", fake)
+    events = list(localmodels.pull("x", base="http://127.0.0.1:11434"))
+    assert events == [
+        ("out", "pull failed: could not connect to registry"),
+        ("exit", 1),
+    ]
+
+
+def test_pull_error_after_progress_still_exits_1(monkeypatch):
+    body = (json.dumps({"status": "pulling manifest"}).encode() + b"\n"
+            + json.dumps({"error": "no space left on device"}).encode() + b"\n")
+    fake = FakeUrlopen(body)
+    monkeypatch.setattr(localmodels, "urlopen", fake)
+    events = list(localmodels.pull("x", base="http://127.0.0.1:11434"))
+    assert events[0] == ("out", "pulling manifest")
+    assert events[-1] == ("exit", 1)
+
+
+def test_pull_truncated_body_exits_1(monkeypatch):
+    # Servidor com Content-Length cortado no meio do corpo: iterar a resposta
+    # nao levanta em EOF antecipado -- so o `length` residual denuncia.
+    body = json.dumps({"status": "success"}).encode() + b"\n"
+    fake = FakeUrlopen(body, length=4096)
+    monkeypatch.setattr(localmodels, "urlopen", fake)
+    events = list(localmodels.pull("x", base="http://127.0.0.1:11434"))
+    assert ("out", "resposta truncada pelo Ollama (download incompleto)") \
+        in events
+    assert events[-1] == ("exit", 1)
+
+
+def test_pull_empty_stream_exits_1(monkeypatch):
+    # Stream sem NENHUM evento valido nao diz nada sobre o download: a ponte
+    # nao pode ver verde onde nao houve manifest.
+    fake = FakeUrlopen(b"\n")
+    monkeypatch.setattr(localmodels, "urlopen", fake)
+    assert list(localmodels.pull("x", base="http://127.0.0.1:11434")) == \
+        [("exit", 1)]
+
+
+def test_a_non_http_service_reports_down_instead_of_raising(monkeypatch):
+    # HTTPException NAO herda de OSError: um servico nao-HTTP na 11434
+    # (Ollama Desktop, proxy, WSL port-forward -- banal no Windows) faria
+    # BadStatusLine escapar de list_models, delete e status.
+    def broken():
+        return FakeUrlopen(error=http.client.BadStatusLine("nao-e-http"))
+
+    monkeypatch.setattr(localmodels, "urlopen", broken())
+    out = localmodels.list_models("http://127.0.0.1:11434")
+    assert out["ok"] is False
+    assert out["error"]
+    monkeypatch.setattr(localmodels, "urlopen", broken())
+    out = localmodels.delete("llama3.2", base="http://127.0.0.1:11434")
+    assert out["ok"] is False
+    assert out["error"]
+    monkeypatch.setattr(localmodels, "urlopen", broken())
+    st = localmodels.status("http://127.0.0.1:11434")
+    assert st["up"] is False
+    assert st["error"]
+
+
+def test_incomplete_read_mid_pull_stream_exits_1(monkeypatch):
+    # IncompleteRead no MEIO da stream, depois de o consumidor ja ter visto
+    # ("out", ...): vira ("out", diagnostico) + ("exit", 1), nunca excecao
+    # escapando pela geradora afora.
+    body = (json.dumps({"status": "pulling manifest"}).encode() + b"\n"
+            + json.dumps({"status": "downloading 42%"}).encode() + b"\n")
+    fake = FakeUrlopen(response=ExplodingResponse(
+        body, http.client.IncompleteRead(b"partial"), after=1))
+    monkeypatch.setattr(localmodels, "urlopen", fake)
+    events = list(localmodels.pull("llama3.2", base="http://127.0.0.1:11434"))
+    assert events[0] == ("out", "pulling manifest")
+    assert events[-1] == ("exit", 1)
+    assert len(events) == 3
+
+
+def test_pull_veto_is_immediate_but_the_network_stays_lazy(monkeypatch):
+    # pull() NAO e mais geradora pura: o veto roda na chamada, sem esperar
+    # o iterador ser consumido -- pull remoto nunca iterado nao escapa ileso.
+    with pytest.raises(ValueError):
+        localmodels.pull("llama3.2", base="http://10.0.0.5:11434")
+    # ...e o contrato observavel (Iterator[tuple]) nao mudou: a rede so
+    # acontece quando alguem itera.
+    fake = FakeUrlopen(json.dumps({"status": "success"}).encode() + b"\n")
+    monkeypatch.setattr(localmodels, "urlopen", fake)
+    iterator = localmodels.pull("llama3.2", base="http://127.0.0.1:11434")
+    assert fake.calls == []
+    assert list(iterator)[-1] == ("exit", 0)
+    assert fake.calls[0]["url"].endswith("/api/pull")
+
+
 def test_delete_uses_the_delete_endpoint(monkeypatch):
+    from thero.settings import OLLAMA_DELETE_TIMEOUT
+
     fake = FakeUrlopen(b"{}")
     monkeypatch.setattr(localmodels, "urlopen", fake)
     out = localmodels.delete("llama3.2", base="http://127.0.0.1:11434")
     assert out["ok"] is True
     assert fake.calls[0]["method"] == "DELETE"
     assert json.loads(fake.calls[0]["data"]) == {"name": "llama3.2"}
+    # delete e MUTACAO, nao sonda: 3 s reportariam falha num apagamento que
+    # aconteceu de verdade (unlink de blobs de GB sob antivirus).
+    assert fake.calls[0]["timeout"] == OLLAMA_DELETE_TIMEOUT == 30
+    assert OLLAMA_DELETE_TIMEOUT > localmodels.OLLAMA_PROBE_TIMEOUT
 
 
 def test_delete_refuses_a_foreign_host():
     with pytest.raises(ValueError):
         localmodels.delete("llama3.2", base="http://10.1.2.3:11434")
+
+
+def test_status_returns_exactly_the_envreport_contract_keys(monkeypatch):
+    # envreport._ollama_probe le com COLCHETES (envreport.py:62-68): um
+    # rename de chave quebraria so em runtime, engolido pelo except largo
+    # do snapshot. Os dois caminhos, up e down.
+    monkeypatch.setattr(localmodels, "urlopen", FakeUrlopen(TAGS))
+    up = localmodels.status("http://127.0.0.1:11434")
+    assert set(up) == {"up", "base", "models", "error"}
+    assert up["up"] is True
+    assert up["base"] == "http://127.0.0.1:11434"
+    assert len(up["models"]) == 2
+    monkeypatch.setattr(localmodels, "urlopen",
+                        FakeUrlopen(error=urllib.error.URLError("down")))
+    down = localmodels.status("http://127.0.0.1:11434")
+    assert set(down) == {"up", "base", "models", "error"}
+    assert down["up"] is False
+    assert down["models"] == []
+    assert down["error"]
+
+
+def test_human_bytes_degrades_to_mb_for_small_models():
+    # Um modelo de 54 MB como "0.0 GB" e lido como "vazio" na tela.
+    assert localmodels.human_bytes(54 * 1024 ** 2) == "54 MB"
+    assert localmodels.human_bytes(int(8.9e9)) == "8.3 GB"
+    assert localmodels.human_bytes(0) == "-"

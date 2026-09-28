@@ -226,3 +226,46 @@ def test_config_present_flips_first_run(tmp_path, monkeypatch):
     cfg.write_text("{}", encoding="utf-8")
     s = _snap(tmp_path, monkeypatch, ["node"])
     assert s["firstRun"] is False
+
+
+def test_ollama_probe_reads_the_real_localmodels_contract(monkeypatch):
+    # envreport._ollama_probe le o dict de localmodels.status() com
+    # COLCHETES; um rename de chave quebraria so em runtime, engolido
+    # pelo except Exception do snapshot. Este teste amarra os dois lados
+    # de verdade, 100% offline (o urlopen do localmodels e que e trocado).
+    import json
+    import urllib.error
+
+    from thero import localmodels
+
+    class Tags:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    body = json.dumps({"models": [{"name": "llama3.2:latest",
+                                   "size": 2020990000}]}).encode("utf-8")
+    monkeypatch.setattr(localmodels, "urlopen",
+                        lambda request, timeout=None: Tags(body))
+    out = envreport._ollama_probe()
+    assert out["up"] is True
+    assert out["host"] == localmodels.OLLAMA_DEFAULT_HOST
+    assert [m["name"] for m in out["models"]] == ["llama3.2:latest"]
+    assert out["error"] == ""
+
+    def down(request, timeout=None):
+        raise urllib.error.URLError("nao escuta")
+
+    monkeypatch.setattr(localmodels, "urlopen", down)
+    out = envreport._ollama_probe()
+    assert out["up"] is False
+    assert out["models"] == []
+    assert out["error"]
