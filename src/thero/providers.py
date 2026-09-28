@@ -195,8 +195,11 @@ def register(provider: dict) -> dict:
         try:
             url_base = localmodels.guard_base(base)
         except ValueError as exc:
+            # O texto da excecao cita a base crua (recebi %r): mesma redacao
+            # de _redact usada em test_endpoint, sem duplicar a regex.
             return {"ok": False, "authState": "bloqueado",
-                    "msg": "modelos locais so por loopback: %s" % exc}
+                    "msg": "modelos locais so por loopback: %s"
+                           % _redact(exc)}
         # Uma sonda de rede so: o veto ja vive dentro de `list_models`, e o
         # `guard_base` acima apenas repete o veto (sem rede) para dar o
         # motivo humano. Consulta `["ok"]`, nunca o dict: `{"ok": False}` e

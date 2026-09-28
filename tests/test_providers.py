@@ -142,6 +142,20 @@ def test_register_local_refuses_a_remote_endpoint(monkeypatch):
     assert "loopback" in out["msg"]
 
 
+def test_register_local_refusal_does_not_echo_the_credential():
+    # O ValueError de _assert_loopback cita a base crua (com userinfo); o
+    # msg daqui e persistido em provider["lastCheck"] pela Task 8, entao
+    # nada do dict de retorno pode carregar a credencial.
+    out = providers.register({"authKind": "local",
+                              "base": "http://usuario"
+                                      ":sk-SEGREDO-NAO-ECOAR"
+                                      "@192.168.0.9:11434"})
+    assert out["ok"] is False
+    assert "loopback" in out["msg"]
+    assert "sk-SEGREDO-NAO-ECOAR" not in json.dumps(out)
+    assert "usuario:" not in json.dumps(out)
+
+
 def test_register_is_silent_about_values_even_when_the_var_is_set(monkeypatch):
     monkeypatch.setenv("THERO_OPENAI_API_KEY", "NUNCA-IMPRIMA-ISTO")
     out = providers.register(CFG["providers"][0])
