@@ -59,20 +59,44 @@ def normalize_base(host: Optional[str] = "") -> str:
     return raw.rstrip("/")
 
 
-def _assert_loopback(base: str) -> str:
+def _assert_loopback_host(base: str) -> str:
     parsed = urlparse(base)
     # O userinfo (ate o ULTIMO "@") nao participa da conexao; o resto do
     # netloc sim, e por isso ele e validado inteiro.
     hostinfo = parsed.netloc.rpartition("@")[2]
     parsed.port  # dentro do veto: ValueError se a porta nao for 0..65535
-    if _LOOPBACK_NETLOC.fullmatch(hostinfo) is None or (
-        parsed.path or parsed.params or parsed.query or parsed.fragment
-    ):
+    if _LOOPBACK_NETLOC.fullmatch(hostinfo) is None:
         raise ValueError(
             "apenas loopback e permitido para modelos locais "
             "(recebi %r)" % (base,)
         )
     return base
+
+
+def _assert_no_path(base: str) -> str:
+    parsed = urlparse(base)
+    if parsed.path or parsed.params or parsed.query or parsed.fragment:
+        raise ValueError(
+            "a base do Ollama nao aceita caminho: os endpoints /api/* sao "
+            "montados em cima dela (recebi %r)" % (base,)
+        )
+    return base
+
+
+def _assert_loopback(base: str) -> str:
+    return _assert_no_path(_assert_loopback_host(base))
+
+
+def has_endpoint_path(base: str) -> bool:
+    """True quando a base aponta para um caminho de API (o "/v1" do LM Studio).
+
+    A API do Ollama mora na raiz, entao caminho presente quer dizer "esta
+    base nao e a API do Ollama" -- e a sonda /api/tags nao vale para ela.
+    Pergunta pura de URL: nenhuma rede, nenhum veto.
+    """
+    parsed = urlparse(normalize_base(base))
+    return bool(parsed.path or parsed.params or parsed.query or
+                parsed.fragment)
 
 
 def _guard(base: str) -> str:
@@ -86,6 +110,14 @@ def _guard(base: str) -> str:
 # recusar host remoto ANTES de montar o payload de escrita de config, e nao
 # deve compor os privados (_guard/_assert_loopback) de outro satellite.
 guard_base = _guard
+
+
+def guard_host(base: str) -> str:
+    """So o veto de HOST loopback -- por causa de provedor local que nao e a
+    API do Ollama (decisao do dono em 2026-09-28, pergunta 1). O caminho
+    passa: nada da gente conecta nessa base, entao nao ha URL a mentir.
+    Para o Ollama em si continua valendo guard_base, caminho recusado."""
+    return _assert_loopback_host(normalize_base(base))
 
 
 def _describe(error: Exception, base: str) -> str:

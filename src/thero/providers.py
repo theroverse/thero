@@ -192,14 +192,25 @@ def register(provider: dict) -> dict:
         if not base:
             return {"ok": False, "authState": "incompleto",
                     "msg": "informe o endpoint local antes de registrar"}
+        # A sonda de modelos e da API do Ollama (/api/tags, na raiz). Uma
+        # base com caminho e outra coisa (LM Studio em /v1): o veto de HOST
+        # loopback continua valendo para todas, e a sonda nao roda contra
+        # uma URL que ela nao entende. Decisao do dono, 2026-09-28.
+        probeable = not localmodels.has_endpoint_path(base)
+        guard = localmodels.guard_base if probeable else localmodels.guard_host
         try:
-            url_base = localmodels.guard_base(base)
+            url_base = guard(base)
         except ValueError as exc:
             # O texto da excecao cita a base crua (recebi %r): mesma redacao
             # de _redact usada em test_endpoint, sem duplicar a regex.
             return {"ok": False, "authState": "bloqueado",
                     "msg": "modelos locais so por loopback: %s"
                            % _redact(exc)}
+        if not probeable:
+            return {"ok": True, "authState": "sem sonda",
+                    "msg": "endpoint local sem a API do Ollama: registrado, "
+                           "sabemos que ele existe, nao sabemos listar os "
+                           "modelos dele"}
         # Uma sonda de rede so: o veto ja vive dentro de `list_models`, e o
         # `guard_base` acima apenas repete o veto (sem rede) para dar o
         # motivo humano. Consulta `["ok"]`, nunca o dict: `{"ok": False}` e
@@ -261,17 +272,24 @@ def test_endpoint(provider: dict) -> dict:
     kind = _auth_kind(provider)
     safe = _redact(base)
     if kind == "local":
-        try:
-            url_base = localmodels.guard_base(base)
-        except ValueError:
-            return {"ok": False,
-                    "msg": "modelos locais so por loopback: %s" % safe}
-        out = localmodels.list_models(url_base)
-        if out["ok"]:
-            return {"ok": True,
-                    "msg": "%s respondeu com %d modelo(s)"
-                           % (safe, len(out["models"]))}
-        return {"ok": False, "msg": _redact(out["error"])}
+        if not localmodels.has_endpoint_path(base):
+            try:
+                url_base = localmodels.guard_base(base)
+            except ValueError:
+                return {"ok": False,
+                        "msg": "modelos locais so por loopback: %s" % safe}
+            out = localmodels.list_models(url_base)
+            if out["ok"]:
+                return {"ok": True,
+                        "msg": "%s respondeu com %d modelo(s)"
+                               % (safe, len(out["models"]))}
+            return {"ok": False, "msg": _redact(out["error"])}
+        # Base com caminho nao e a API do Ollama: nao temos sonda para ela,
+        # e dizer "respondeu" seria uma verificacao inventada. O registro
+        # aconteceu (`register` anotou "sem sonda"); aqui so diz isso.
+        return {"ok": False,
+                "msg": "sem teste disponivel: o Thero so sabe sondar a API "
+                       "do Ollama, e %s nao e ela" % safe}
     return {"ok": True,
             "msg": "endpoint anotado (%s) - o Thero nao faz chamada "
                    "autenticada por aqui" % safe}

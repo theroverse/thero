@@ -603,3 +603,47 @@ def test_register_local_marks_a_dead_loopback_as_sem_resposta(monkeypatch):
     # o veto de loopback foi passado; o endpoint e que nao respondeu agora.
     assert out["ok"] is False
     assert out["authState"] == "sem resposta"
+
+
+LMSTUDIO = {"id": "lmstudio", "authKind": "local", "kind": "local",
+            "base": "http://127.0.0.1:1234/v1",
+            "transport": "OpenAI-compativel local"}
+
+
+def test_register_aceita_um_local_nao_ollama_sem_a_sonda_da_api(monkeypatch):
+    # A sonda e GET /api/tags: contra um /v1 ela daria 404 e o LM Studio
+    # sairia "sem resposta" -- falso. Ele entra anotado como nao verificavel,
+    # e a tela diz isso com estas palavras (decisao do dono).
+    def never(*a, **k):
+        raise AssertionError("a sonda do Ollama nao roda contra /v1")
+
+    monkeypatch.setattr(providers.localmodels, "list_models", never)
+    out = providers.register(dict(LMSTUDIO))
+    assert out["ok"] is True
+    assert out["authState"] == "sem sonda"
+    assert "listar" in out["msg"]
+
+
+def test_register_nao_solta_o_veto_de_host_para_um_local_com_caminho(
+        monkeypatch):
+    # Mesma base com caminho, host remoto: continua bloqueado, e o motivo nao
+    # pode falar em "caminho" (que agora e legitimo) -- e o host.
+    def never(*a, **k):
+        raise AssertionError("nada de rede atras de um host bloqueado")
+
+    monkeypatch.setattr(providers.localmodels, "list_models", never)
+    out = providers.register(dict(LMSTUDIO, base="http://10.0.0.9:1234/v1"))
+    assert out["ok"] is False
+    assert out["authState"] == "bloqueado"
+    assert "loopback" in out["msg"]
+    assert "10.0.0.9" in out["msg"]      # o host aparece, a chave nao
+
+
+def test_test_endpoint_diz_que_nao_sonda_o_que_nao_e_ollama(monkeypatch):
+    def never(*a, **k):
+        raise AssertionError("sem sonda aqui")
+
+    monkeypatch.setattr(providers.localmodels, "list_models", never)
+    out = providers.test_endpoint(dict(LMSTUDIO))
+    assert out["ok"] is False
+    assert "Ollama" in out["msg"]

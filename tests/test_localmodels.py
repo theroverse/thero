@@ -415,3 +415,33 @@ def test_human_bytes_degrades_to_mb_for_small_models():
     assert localmodels.human_bytes(54 * 1024 ** 2) == "54 MB"
     assert localmodels.human_bytes(int(8.9e9)) == "8.3 GB"
     assert localmodels.human_bytes(0) == "-"
+
+
+def test_guard_host_leaves_a_non_ollama_local_path_alone():
+    # Decisao do dono (2026-09-28, pergunta 1): o veto de HOST loopback vale
+    # para todos; o que e especifico do Ollama e a sonda de modelos, e morar
+    # na raiz. O LM Studio fala OpenAI-compativel em /v1 -- sem esta porta
+    # ele nao existe como provedor.
+    assert localmodels.guard_host(
+        "http://127.0.0.1:1234/v1") == "http://127.0.0.1:1234/v1"
+    assert localmodels.guard_host("localhost:1234/v1") == (
+        "http://localhost:1234/v1")
+    with pytest.raises(ValueError) as exc:
+        localmodels.guard_host("http://10.0.0.5:1234/v1")
+    assert "apenas loopback" in str(exc.value)
+
+
+def test_guard_base_still_refuses_a_path_because_it_is_the_ollama_api():
+    # O caminho continua proibido ONDE ele mentira: as chamadas reais
+    # (/api/tags, /api/pull, DELETE /api/models) sao montadas em cima da
+    # base, entao "/v1" produziria uma URL inexistente.
+    for bad in ("http://127.0.0.1:11434/v1", "http://127.0.0.1:11434/../"):
+        with pytest.raises(ValueError) as exc:
+            localmodels.guard_base(bad)
+        assert "caminho" in str(exc.value)
+
+
+def test_has_endpoint_path_is_the_question_register_asks():
+    assert localmodels.has_endpoint_path("http://127.0.0.1:1234/v1") is True
+    assert localmodels.has_endpoint_path("localhost:11434") is False
+    assert localmodels.has_endpoint_path("http://localhost:11434/") is False
