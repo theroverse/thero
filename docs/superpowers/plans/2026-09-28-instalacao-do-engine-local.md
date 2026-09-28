@@ -4,13 +4,13 @@
 
 **Goal:** Fazer o Thero entregar na máquina do usuário o **mesmo estado de uma instalação manual do Ollama** — motor instalado como programa normal do usuário, modelo baixado na pasta padrão dele, acesso por HTTP em loopback e as variáveis de ambiente de sempre — sem nunca ser dono do processo do motor.
 
-**Architecture:** Quatro módulos novos, pequenos, todos chamáveis pela ponte, com a fronteira de rede/processo **injetável** em cada um: `enginedata.py` (só evidência medida: URL, digest publicado, tamanho, assinante), `artifactcheck.py` (SHA-256 + assinatura Authenticode lida pelo próprio Windows, fail-closed), `download.py` (bytes num `.part` que só vira arquivo final depois do digest bater) e `engineinstall.py` (a máquina de estados `probe → plan → consent → execute`, que **observa** o motor por HTTP e escreve apenas a `$PROFILE` via `apply.py`). `localmodels.py` continua sendo o único cliente do Ollama e não ganha gestão de processo; o veto de loopback dele **não é tocado**. Um quinto módulo, `localep.py`, resolve o provedor local não-Ollama (LM Studio) sem afrouxar segurança.
+**Architecture:** Quatro módulos novos, pequenos, todos chamáveis pela ponte, com a fronteira de rede/processo **injetável** em cada um: `enginedata.py` (só evidência medida: URL, digest publicado, tamanho, assinante), `artifactcheck.py` (SHA-256 + assinatura Authenticode lida pelo próprio Windows, fail-closed), `download.py` (bytes num `.part` que só vira arquivo final depois do digest bater) e `engineinstall.py` (a máquina de estados `probe → plan → consent → execute`, que **observa** o motor por HTTP e escreve apenas a `$PROFILE` via `apply.py`). `localmodels.py` continua sendo o único cliente do Ollama e não ganha gestão de processo; o veto de loopback dele **não é tocado**. O provedor local não-Ollama (LM Studio) **já foi resolvido** na árvore pelo commit `0287c92` (`localmodels.guard_host` + `has_endpoint_path` + `authState "sem sonda"`): a Task 9 deste plano não reescreve isso, só trava o contrato por teste.
 
 **Tech Stack:** Python 3.9+ stdlib apenas (`urllib`, `hashlib`, `subprocess`, `shutil`, `re`, `json`, `ast`, `pathlib`, `datetime`), pytest offline. Rede e subprocesso sempre passados por parâmetro ou monkeypatchados na costura pública do módulo (padrão real do repo: `localmodels.urlopen`). Exceção stdlib única e declarada: abrir um filho de PowerShell para ler a assinatura Authenticode — stdlib não verifica Authenticode no Windows (Task 7).
 
 **Branch:** `feat/gui-engine-bridge` no submódulo `thero`. Commits **locais**, nunca `main`, nunca `push`.
 
-**Baseline medido nesta sessão:** `cd thero && python -m pytest tests/ -q` → **416 passed** (Python 3.14.7 local; matriz CI inclui 3.9). Todas as contagens acumuladas abaixo partem de 416. (O enunciado da tarefa citava 400; o número real é 416 — use 416.)
+**Baseline:** a árvore está sendo editada por outros agentes enquanto este plano é escrito e executado (`python -m pytest tests/ -q` deu **416 passed** no início desta sessão de planejamento e **444 passed / 13 failed** às 02:2x, com trabalhos em curso). Por isso a cadeia de contagem abaixo é escrita em função de `B`, o baseline **medido por você na Task 0**, e não de um número fixo. Onde está escrito `B + 41`, leia `pytest -q` e confira que o total subiu exatamente 41 desde a Task 0.
 
 > **Correção de baseline na hora de executar (2026-09-28, depois deste plano ser
 > escrito).** A suíte da ponte andou: `22ea931` + `5fcc3b7` + `b4bb7ec` +
@@ -18,7 +18,9 @@
 > ponte (`--config`/`limits`, ainda não executada) acrescenta mais 15. As
 > contagens "acumulada: NNN" abaixo continuam valendo como **delta** desta
 > tarefa para a seguinte; o ponto de partida de cada executor é `python -m
-> pytest tests/ -q` rodado ali, não o número impresso aqui.
+> pytest tests/ -q` rodado ali, não o número impresso aqui. **Já aplicado:** a
+> cadeia abaixo foi reescrita como `B + k` e a Task 0 é onde `B` é medido
+> (junto com as falhas que já estavam na árvore, que não são deste plano).
 
 ---
 
@@ -55,13 +57,39 @@ demanda foi implementado no plano da ponte, no módulo **`engineproc.py`**
 `2026-09-22-gui-engine-bridge.md`). Este plano continua sendo o dono de
 **instalar e baixar**; nenhum módulo daqui passa a gerir processo, e a trava
 `assert_not_lifecycle` abaixo vale **para os módulos deste plano**
-(`enginedata`/`artifactcheck`/`download`/`engineinstall`/`localep`) — que é o
+(`enginedata`/`artifactcheck`/`download`/`engineinstall`) — que é o
 escopo que ela já tem hoje. Quem executar a Task 11 não precisa afrouxar nada:
 `["ollama", "serve"]` continua banned **aqui**, e é o `engineproc.py` do outro
 plano que tem o caminho consentido.
 
 
 **A linha do plano que torna o item 2 inafastável em código** é `engineinstall.assert_not_lifecycle()` (Task 11): **toda** linha de comando que o módulo gera passa por ela **antes** de virar processo, e um argv contendo `serve`/`start`/`stop`/`restart`/`kill`/`schtasks`/`reg add`/`sc create` levanta `OwnershipError`. Ela é amarrada por teste na Task 11 (item 3), na Task 12 (item 12) e na varredura AST da Task 13 (item 5). O docstring do módulo repete a regra em uma frase: *"O Thero NUNCA inicia, para, reinicia nem mantém o Ollama: apenas observa a porta por HTTP, com paciência."*
+
+
+### 1.1 Conflito vivo encontrado na árvore (lido em 2026-09-28, às 02:2x)
+
+Enquanto este plano era escrito, apareceu na árvore um arquivo **não commitado** de
+outro trabalho: `src/thero/engineproc.py` (+ `tests/test_engineproc.py`, + a constante
+`OLLAMA_START_WAIT` em `src/thero/settings.py`). Ele expõe `start()` e `restart()` que
+fazem `subprocess.Popen([binary, "serve"], creationflags=DETACHED_PROCESS | ...)`, com
+o comentário *"Nos nao somos o servico que hospeda o motor"*.
+
+**Isto choca com o item 2 da espinha dorsal acima**, que é literal: "ele não vai subir
+junto com o nosso programa/serviço", e com a regra "nunca spawnamos `ollama serve`". Um
+`Popen` desanexado nosso é o nosso programa iniciando o motor — com o pretexto de que o
+processo fica órfão. Não é este plano que decide isso: **é a Pergunta 10 do dono.**
+
+O que este plano faz com essa realidade:
+
+- Nenhuma task daqui importa, chama ou copia `engineproc`. As Tasks 10-13 tratam o motor
+  ausente/parado como **estado a reportar**, nunca a corrigir com spawn (Task 11,
+  `wait_for_engine`: observar com paciência e pedir ao usuário que abra o Ollama).
+- `engineinstall.assert_not_lifecycle()` continua recusando `serve` em qualquer argv
+  gerado por nós — inclusive se alguém tentar "aproveitar" o `engineproc` dentro de
+  `execute` (a Task 13 prova isso pela varredura AST do único ponto de subprocesso).
+- Se o dono decidir que o start manual-assistido do `engineproc` é aceitável, isso entra
+  no plano da ponte como decisão explícita dele, com a linha "nós não somos donos do
+  processo" reescrita lá — **não** por uma emenda silenciosa neste plano.
 
 ---
 
@@ -83,7 +111,10 @@ plano que tem o caminho consentido.
 
 | Fato | Como foi verificado hoje |
 |---|---|
-| Baseline: **416 passed** | `python -m pytest tests/ -q` |
+| Baseline no início do planejamento **416 passed**; às 02:2x **444 passed, 13 failed** (outros agentes na árvore) → a contagem deste plano é relativa a `B`, medido na Task 0 | `python -m pytest tests/ -q` |
+| Provedor local **não-Ollama já entregue** (`0287c92`): `localmodels.has_endpoint_path`, `localmodels.guard_host`, `authState "sem sonda"`; `guard_base` continua recusando caminho | `src/thero/localmodels.py:62-120`, `providers.py:195-215` |
+| `system.process.stream_command` **já existe** (`b4bb7ec`) e produz `("out", linha)`/`("exit", código)` | `src/thero/system/process.py:75` |
+| Por arquivo hoje: `test_providers.py` 59, `test_localmodels.py` 32, `test_apply.py` 38 | `pytest -q` por arquivo |
 | `ollama` **não** está no PATH; `%LOCALAPPDATA%\Programs\Ollama` **não existe** | `shutil.which("ollama")` → `None` |
 | **Mas** `~/.ollama/models` **existe**, com 8 arquivos e **13.671.200.219 bytes**; manifests de `qwen2.5/7b` e `qwen2.5-coder/14b` | `Path.home()/'.ollama'/'models'` |
 | Estado "modelo presente, motor ausente" é **real** aqui → o plano tem de tratá-lo | dedução das duas linhas acima |
@@ -100,7 +131,8 @@ plano que tem o caminho consentido.
 | `apply.profile_env_block` escreve os dois pares; `_ollama_base` só casa `preset/id == "ollama"` → LM Studio não vaza para `ATHENA_OLLAMA_HOST` | `src/thero/apply.py:285-325` |
 | Athena lê `ATHENA_OLLAMA_HOST` **sem validar host** (default `http://localhost:11434`, modelo `llama3.2`) → o veto tem de morar em quem escreve | `athena/src/athena/settings.py:45-72` |
 | Sentinel veta non-loopback no próprio código e hoje declara "quem prove o motor é o usuário ou o Genesis" | `sentinel/src/sentinel/settings.py:255-283`, `local_model.py:82-96` |
-| `process.stream_command` **ainda não existe** (Task 7 da ponte, em curso); só `run_command` | `src/thero/system/process.py` |
+| `shutil.disk_usage` / `shutil.which` são as únicas leituras de disco/PATH de que o plano precisa (já usados em `envreport.py`) | `src/thero/envreport.py:34-35` |
+| **Conflito lido hoje:** `src/thero/engineproc.py` (não commitado, de outro trabalho) faz `Popen([binary, "serve"], DETACHED_PROCESS)` em `start()`/`restart()`; `OLLAMA_START_WAIT = 6` foi acrescentado a `settings.py` por ele | lido nesta sessão (seção 1.1 e Pergunta 10) |
 | O plano do time (`2026-09-28-registro-de-equipe.md`) referencia este trabalho como `plan: onboarding-motor-local` — **este arquivo é ele** | seção "Pré-requisito referenciado" daquele plano |
 
 **O que este plano muda na premissa do Sentinel:** apenas o fato de que alguém pode ter instalado o motor por nós (com clique do dono). A validação de segurança do Sentinel continua válida e **não é tocada**: nenhum arquivo fora de `thero/` é modificado por este plano.
@@ -109,11 +141,12 @@ plano que tem o caminho consentido.
 
 ## 4. Dependência declarada: a ponte GUI↔motor está sendo escrita
 
-O plano `docs/superpowers/plans/2026-09-22-gui-engine-bridge.md` (Tasks 7-12) está em execução por outro agente agora. **Não edite esse arquivo e não escreva em `bridge.py`, `gui/*`, `build.ps1`.**
+O plano `docs/superpowers/plans/2026-09-22-gui-engine-bridge.md` está em execução por outro agente **enquanto este é escrito** (as Tasks 7-12 dele). **Não edite esse arquivo e não escreva em `bridge.py`, `gui/*`, `build.ps1`, `system/process.py`.**
 
-- A única superfície destinada à ponte é a função do motor: `engineinstall.execute(plan_out, *, consent, progress, workdir, cfg, deps)` com `progress(step: str, detail: str, percent: int)` (percent `-1` = desconhecido) e `consent(plan_out) -> bool`. Ela é **síncrona** e devolve um relatório JSON-safe; a barra de progresso visual, o worker e o cancelamento moram na ponte e **não** são deste plano.
-- Para o painel de terminal da ponte, a Task 11 também entrega `engineinstall.stream_model(name, ...)` que produz exatamente `("out", linha)` / `("exit", código)` — o contrato que `localmodels.pull` já promete e que a Task 7 da ponte pretende expor como `system.process.stream_command`. Nenhuma das duas funções usa `print()`.
-- Consequência prática: **nenhuma task daqui depende da ponte para passar.** Se você (executor) chegar na Task 14 e a ponte já estiver no tree, declare isso na Pergunta 6 do dono antes de encostar em `bridge.py`.
+- A única superfície destinada à ponte é a função do motor: `engineinstall.execute(plan_out, *, consent, progress, workdir, cfg, deps)`, com `progress(step: str, detail: str, percent: int)` (percent `-1` = desconhecido) e `consent(plan_out) -> bool`. Ela é **síncrona** e devolve um relatório JSON-safe. A barra de progresso visual, o worker e o cancelamento moram na ponte e **não** são deste plano: é exatamente por isso que `execute` nunca imprime e nunca assume janela aberta.
+- A Task 11 também entrega `engineinstall.stream_model(name, *, base="", emit=None)`, que produz `("out", linha)` / `("exit", código)` — a mesma forma que `system.process.stream_command` entrega hoje (a Task 7 da ponte foi embarcada em `b4bb7ec`), de propósito: a ponte junta os dois fluxos no painel de terminal sem adaptar nada. Nenhuma das duas funções usa `print()`.
+- Consequência prática: **nenhuma task daqui depende da ponte para passar.** Se você sentir falta de um handler ao executar a Task 13, **pare e registre como dependência** na Pergunta 6 do dono; não escreva na ponte.
+- Colisões conhecidas: `providers.py` e `localmodels.py` foram tocados pela ponte neste mesmo dia (`0287c92`). Se uma task sua precisar mexer neles, confirme primeiro com `git status --short src/` que não há trabalho de outra pessoa pendente no arquivo.
 
 ---
 
@@ -130,6 +163,8 @@ O plano `docs/superpowers/plans/2026-09-22-gui-engine-bridge.md` (Tasks 7-12) es
 
 Rodar testes sempre de `c:/Users/anthe/.myscripts/thero`: `python -m pytest tests/ -q`.
 
+**Contagem:** as "Expected" abaixo são escritas como `B + k`, com `B` medido na Task 0. Verifique `k` (o delta), não o total absoluto: outros agentes estão somando testes a esta árvore enquanto você executa.
+
 ---
 
 ## 6. File Structure
@@ -141,16 +176,35 @@ Rodar testes sempre de `c:/Users/anthe/.myscripts/thero`: `python -m pytest test
 - `thero/src/thero/download.py` — `to_file`: https obrigatório, nome validado, `.part` dentro do workdir, `os.replace` só depois do digest bater, teto de bytes, pulo-idempotente quando o arquivo íntegro já existe.
 - `thero/src/thero/engineinstall.py` — o provisionamento: `assert_not_lifecycle`/`OwnershipError`, `probe`, `has_model`, `plan`, `release_info`, `launch_installer`, `wait_for_engine`, `percent_from_line`, `ensure_model`, `stream_model`, `consumer_env_targets`, `resolve_profile`, `write_consumer_env`, `execute`, `advice`.
 **Nenhum arquivo de estado**: a idempotência vem de re-observar a máquina (ver seção "Idempotência", Task 12).
-- `thero/src/thero/localep.py` — endpoint local **não**-Ollama: `normalize`, `guard_endpoint` (loopback + http(s) + sem userinfo, **path permitido**), `reachable`. Nenhuma suposição do Ollama.
-- Testes: `tests/test_enginedata.py`, `tests/test_artifactcheck.py`, `tests/test_download.py`, `tests/test_localep.py`, `tests/test_providers_local_non_ollama.py`, `tests/test_engineinstall_plan.py`, `tests/test_engineinstall_steps.py`, `tests/test_engineinstall_execute.py`, `tests/test_engineinstall_invariants.py`.
+- Testes: `tests/test_enginedata.py`, `tests/test_artifactcheck.py`, `tests/test_download.py`, `tests/test_providers_local_non_ollama.py`, `tests/test_engineinstall_plan.py`, `tests/test_engineinstall_steps.py`, `tests/test_engineinstall_execute.py`, `tests/test_engineinstall_invariants.py`.
 
 **Modifica:**
 
-- `thero/src/thero/providers.py` — o ramo `kind == "local"` de `register`/`test_endpoint` distingue família Ollama (sonda `/api/tags`, comportamento de hoje intacto) de local não-Ollama (valida com `localep`, registra **sem** a sonda Ollama, mensagem honesta redigida por `providers.redact`). Task 9.
+- `thero/tests/test_providers_local_non_ollama.py` — Task 9 **não** muda `src/`: o ramo não-Ollama já foi entregue (`0287c92`). A task trava por teste o contrato que o onboarding consome.
 - `thero/README.md` — uma seção "Motor local: instalar é uma coisa, ter o processo é outra". Task 14.
 - Este arquivo — seção 12 (evidência das Tasks 1-5).
 
 **Não toca (deliberadamente):** `localmodels.py` (nem `_assert_loopback`, nem o contrato de `pull`), `envreport.py`, `apply.py`, `presets.py`, `config.py`, `settings.py`, `bridge.py`/`gui/*`/`build.ps1` (zona da ponte), `docs/superpowers/plans/2026-09-22-gui-engine-bridge.md`, e qualquer arquivo fora de `thero/`.
+
+---
+
+### Task 0: Medir o baseline `B` (a árvore está em movimento)
+
+Outros agentes estão escrevendo nesta árvore agora (o plano da ponte e o do time). Nenhuma contagem deste documento faz sentido sem você medir o ponto de partida **depois** de pegar o estado atual.
+
+- [ ] **Step 1: Atualizar e medir**
+
+```bash
+git status --short
+git log --oneline -3
+python -m pytest tests/ -q
+```
+
+Anotar `B` = o número de `passed` da última linha. **Se houver `failed` na árvore agora**, anote também a lista: falha que já estava aqui não é deste plano, e o portão final (Task 15) só exige que o seu trabalho não tenha **acrescentado** falha nenhuma.
+
+- [ ] **Step 2: Não commitar nada**
+
+Nada nesta task muda arquivo. Se `git status --short` já mostrar modificação de `src/thero/*` que não é sua, **não commite junto**: avise o dono na hora (ele ficará horas ausente) e trabalhe por cima sem tocar naqueles arquivos.
 
 ---
 
@@ -290,34 +344,50 @@ git commit -m "docs(plano-engine): E2 digest publicado verificado"
 - [ ] **Step 1: Baixar o artefato na pasta de trabalho (sem instalá-lo)**
 
 ```bash
+mkdir -p "$TEMP/thero-engine-probe"
+curl -L --proto-redir =https -o "$TEMP/thero-engine-probe/OllamaSetup.exe" \
+  https://ollama.com/download/OllamaSetup.exe
+certutil -hashfile "%TEMP%\thero-engine-probe\OllamaSetup.exe" SHA256
+```
+
+`--proto-redir =https` não é enfeite: a URL redireciona (Task 1) e um redirect para `http://` trocaria o transporte no meio da descarga. Depois que a Task 8 existir, o mesmo download pode ser refeito pelo código do produto — o que serve de teste vivo dele:
+
+```bash
 python - <<'PY'
-import os
 from pathlib import Path
 from thero import download
-work = Path(os.environ.get("TEMP") or Path.home()) / "thero-engine-probe"
+work = Path.home() / "AppData" / "Local" / "Temp" / "thero-engine-probe"
 out = download.to_file(
     "https://ollama.com/download/OllamaSetup.exe", "OllamaSetup.exe", work)
-print(out)
+print(out["ok"], out["bytes"], out["sha256"], out["reason"])
 PY
 ```
 
-Se `thero.download` ainda não existir (Tasks 6-8 vêm depois), usar o equivalentes stdlib de uma vez e anotar o caminho:
-
-```bash
-curl -L --proto-redir =https -o "$TEMP/thero-engine-probe/OllamaSetup.exe" \
-  https://ollama.com/download/OllamaSetup.exe
-```
-
-Anotar: bytes recebidos vs. `Content-Length` da Task 1, e o SHA-256 medido (`certutil -hashfile ... SHA256`).
+Anotar: bytes recebidos vs. `Content-Length` da Task 1 e o SHA-256 medido. **O `.exe` baixado não é executado nesta task** (a Task 3 para aqui; instalar é a Task 12, com clique).
 
 - [ ] **Step 2: Ler a assinatura do arquivo baixado (não instala nada)**
 
+Rodar pelo Python com argv em lista: no PowerShell de uma linha pelo bash, o `|` dentro da aspa do script é armadilha de quoting, e o argv em lista não tem shell no meio (é a mesma forma que `artifactcheck.sign_command` usa na Task 7):
+
 ```bash
-powershell -NoProfile -NonInteractive -Command \
-  '$s = Get-AuthenticodeSignature -LiteralPath (Join-Path $env:TEMP "thero-engine-probe/OllamaSetup.exe"); $s.Status.ToString() + \"|\" + $s.SignerCertificate.Subject'
+python - <<'PY'
+import subprocess
+from pathlib import Path
+target = (Path.home() / "AppData" / "Local" / "Temp" / "thero-engine-probe"
+          / "OllamaSetup.exe")
+quoted = "'" + str(target).replace("'", "''") + "'"
+script = ("$s = Get-AuthenticodeSignature -LiteralPath " + quoted
+          + "; $s.Status.ToString() + '|' + $s.SignerCertificate.Subject")
+out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                      "-Command", script],
+                     capture_output=True, text=True, encoding="utf-8",
+                     errors="replace", timeout=120, shell=False)
+print("rc", out.returncode)
+print("saida", (out.stdout or "").strip())
+PY
 ```
 
-Anotar a linha `Status|Subject` **completa**. É o `Subject` que vira `EXPECTED_PUBLISHER` na Task 6 — hoje o plano só tem a substring `"Ollama"`, que é uma **hipótese** até este Step rodar.
+Forma da saída (medida hoje com `svchost.exe`): `Valid|CN=Microsoft Windows, O=Microsoft Corporation, L=Redmond, S=Washington, C=US`. Anotar a linha `Status|Subject` **completa** do artefato do Ollama: é o `Subject` que vira `EXPECTED_PUBLISHER` na Task 6 — hoje o plano só tem a substring `"Ollama"`, que é uma **hipótese** até este Step rodar.
 
 - [ ] **Step 3: Inspeção estática do artefato (tecnologia do empacotador)**
 
@@ -514,12 +584,18 @@ Anotar quais defaults já existem como manifest (motor ausente ≠ modelo ausent
 - [ ] **Step 3: Formato da linha de progresso do pull (só com o motor de pé)**
 
 ```bash
-python - <<'PY'
+PYTHONPATH=src python - <<'PY'
 from thero import localmodels
+import time
+started = time.time()
 for kind, line in localmodels.pull("llama3.2:1b"):
-    print(kind, repr(line)[:120])
+    print("%.1fs" % (time.time() - started), kind, repr(line)[:120])
+    if kind == "exit":
+        break
 PY
 ```
+
+`PYTHONPATH=src` porque `pythonpath = pytest.ini` so vale dentro do pytest (verificado hoje: sem ele, `import thero` falha fora da suíte). O prefixo de tempo e o que responde "primeira linha em quanto tempo", que e o dado que a tela de progresso precisa.
 
 Anotar se as linhas trazem percentual (`NN %`) e se algum evento carrega `completed`/`total`. Sem motor na máquina, anotar `PENDENTE` — `percent_from_line` (Task 11) trata os dois casos e é testado com as duas formas. **Não** trocar o contrato de `localmodels.pull` para acrescentar campos: isso é decisão da ponte (Task 7 lá), não daqui.
 
@@ -724,7 +800,7 @@ Run: `python -m pytest tests/test_enginedata.py -q`
 Expected: `13 passed` (6 funções de caso único + 7 casos de `test_checksums_url_refuses_anything_else`)
 
 Run: `python -m pytest tests/ -q`
-Expected: `429 passed`
+Expected: `B + 13` passed
 
 - [ ] **Step 5: Commit local**
 
@@ -733,7 +809,7 @@ git add src/thero/enginedata.py tests/test_enginedata.py
 git commit -m "feat(enginedata): evidencia medida da fonte do motor pinada num modulo so"
 ```
 
-**Contagem acumulada: 429.** (Se você recontar e achar outro número, **reescreva a cadeia inteira** abaixo a partir do seu número real — o que vale é o `pytest -q` da máquina, não este texto.)
+**Acumulado: B + 13.**
 
 ---
 
@@ -1138,7 +1214,7 @@ Run: `python -m pytest tests/test_artifactcheck.py -q`
 Expected: `28 passed` (18 funções de caso único + 4 casos do marcador binário + 6 casos de JSON lixo)
 
 Run: `python -m pytest tests/ -q`
-Expected: `457 passed`
+Expected: `B + 41` passed
 
 - [ ] **Step 5: Commit local**
 
@@ -1147,7 +1223,7 @@ git add src/thero/artifactcheck.py tests/test_artifactcheck.py
 git commit -m "feat(artifactcheck): sha256 publicado e assinatura authenticode como travas"
 ```
 
-**Contagem acumulada: 457.**
+**Acumulado: B + 41.**
 
 ---
 
@@ -1212,10 +1288,16 @@ class FakeUrlopen:
         return FakeResponse(self._chunks)
 
 
-def get(url="https://x/OllamaSetup.exe", name="OllamaSetup.exe", workdir,
-        **kwargs):
+def get(url="https://x/OllamaSetup.exe", name="OllamaSetup.exe",
+        tmp_path=None, **kwargs):
+    """Atalho dos testes: o workdir e o `tmp_path` do fixture, sempre.
+
+    O `opener` e sempre injetado aqui (nunca monkeypatch de rede implicita):
+    e o padrao do repo, e e o que garante que a suite rode sem internet.
+    """
     fake = kwargs.pop("opener", None) or FakeUrlopen([BODY])
-    return download.to_file(url, name, workdir, opener=fake, **kwargs), fake
+    out = download.to_file(url, name, tmp_path, opener=fake, **kwargs)
+    return out, fake
 
 
 def test_it_writes_the_file_and_reports_the_digest(tmp_path):
@@ -1339,17 +1421,6 @@ def test_the_request_is_an_object_never_a_bare_string(tmp_path):
     _, fake = get(tmp_path=tmp_path, expected_sha256=GOOD)
     assert hasattr(fake.requests[0][0], "full_url")
 ```
-
-**Correção de sintaxe obrigatória:** a assinatura do helper `get` acima está errada (`**kwargs` depois de `workdir` posicional não funciona com `tmp_path=` como keyword). Escreva assim, e use exatamente esta versão:
-
-```python
-def get(url="https://x/OllamaSetup.exe", name="OllamaSetup.exe",
-        workdir=None, **kwargs):
-    fake = kwargs.pop("opener", None) or FakeUrlopen([BODY])
-    return download.to_file(url, name, workdir, opener=fake, **kwargs), fake
-```
-
-(chamadas no corpo dos testes passam `workdir` via `tmp_path`: substituir `get(tmp_path=tmp_path, ...)` por `get(workdir=tmp_path, ...)`.)
 
 - [ ] **Step 2: Rodar para ver falhar**
 
@@ -1508,7 +1579,7 @@ Run: `python -m pytest tests/test_download.py -q`
 Expected: `19 passed` (14 funções de caso único + 5 casos de nome rejeitado)
 
 Run: `python -m pytest tests/ -q`
-Expected: `476 passed`
+Expected: `B + 60` passed
 
 - [ ] **Step 5: Commit local**
 
@@ -1517,170 +1588,54 @@ git add src/thero/download.py tests/test_download.py
 git commit -m "feat(download): https, teto de bytes e .part publicado so depois do digest"
 ```
 
-**Contagem acumulada: 476.**
+**Acumulado: B + 60.**
 
 ---
 
 ## Fase C — O que não é Ollama (Task 9)
 
-### Task 9: `localep.py` + registro de provedor local não-Ollama (LM Studio)
+### Task 9: Amarrar o provedor local não-Ollama (JÁ IMPLEMENTADO — não reescrever)
 
-O preset `lmstudio` (`src/thero/presets.py:59-62`, base `http://127.0.0.1:1234/v1`) é loopback real, mas hoje **não consegue ser registrado**: `localmodels._assert_loopback` recusa URL com path porque o cliente é específico do Ollama e monta `/api/tags` em cima de uma base seca.
+**Isto mudou durante a escrita deste plano.** O commit `0287c92` (`feat(providers): LM Studio registravel sem a sonda do Ollama, veto de host intacto`) já entregou o requisito, com desenho **diferente** do que este plano prescrevia (`localep.py` + `providers._ollama_family`): o classificador shipped é `localmodels.has_endpoint_path(base)` e o veto de host solto é `localmodels.guard_host(base)`. **Não criar `localep.py`, não adicionar `_ollama_family`, não mexer em `presets.py`.** Duplicar aqui seria deixar duas fontes da mesma regra — exatamente o que o docstring de `providers.redact` proíbe.
 
-Regras duras desta task (não são negociáveis, não são "melhoráveis"):
+O que **é** desta task: travar por teste o contrato que o onboarding do motor (Tasks 10-13) passa a consumir, porque hoje só existem os 6 testes do próprio commit e eles não amarram a fronteira de segurança que nos interessa.
 
-- **Não afrouxe o veto de host.** Loopback continua sendo segurança, não estética.
-- **Não transforme LM Studio em Ollama.** Nada de chamar `/api/tags`, nada de adivinhar rota.
-- **Nenhuma mudança em `localmodels._assert_loopback`** (nem em `normalize_base`, nem em `guard_base`). A validação nova vive em `localep.py`, um módulo separado, com política própria: **host loopback obrigatório, `http`/`https`, sem userinfo na URL** — e path **permitido**.
-- O dono já aceitou a direção: um provedor `authKind="local"` cujo transporte não é Ollama é registrado **sem** a sonda Ollama, e a tela diz explicitamente *"sabemos que existe, mas não sabemos listar os modelos dele"*.
-- A mensagem **não pode ecoar credencial** da base: reutilizar `providers.redact` (única fonte da regex de redação).
+Regras que continuam duras e que os testes abaixo provam:
 
-> **O que já foi feito antes desta task (commit `0287c92`, 2026-09-28).** A
-> metade barata dessa decisão entrou no repo enquanto este plano era escrito:
-> `localmodels` ganhou `guard_host()` (só o veto de host) e
-> `has_endpoint_path()`, e os ramos `kind == "local"` de `providers.register`
-> e `providers.test_endpoint` registram uma base com caminho **sem** a sonda
-> `/api/tags` (`authState "sem sonda"`, com o texto "sabemos que existe, não
-> sabemos listar os modelos dele"). `_assert_loopback` foi **dividido em duas
-> funções internas** (`_assert_loopback_host` + `_assert_no_path`) sem mudar o
-> contrato observável: `guard_base` continua recusando caminho, com mensagem
-> nova e mais específica. Ou seja: a proibição acima ("nenhuma mudança em
-> `_assert_loopback`) lia-se "não afrouxe a segurança", e nada foi afrouxado.
->
-> Consequência para quem executar esta task: **não reimplemente o ramo de
-> registro.** O trabalho que resta é o que só o `localep.py` faz: a **sonda de
-> presença** na base informada (GET simples, sem rota de Ollama, host loopback
-> obrigatório, sem userinfo, `providers.redact` no msg) e o campo explícito
-> `ollamaFamily` no provedor, que substitui a inferência por caminho quando
-> estiver presente. Onde os dois brigarem, `ollamaFamily` manda; `has_endpoint_path`
-> fica como fallback para provedor antigo, salvo sem o campo.
+- `_assert_loopback` **não** foi afrouxado: virou dois vetos (`_assert_loopback_host` + `_assert_no_path`) e `guard_base` continua sendo os dois em série. Provar isso é o teste 5.
+- O LM Studio **não** vira Ollama: sem sonda, sem `/api/tags`, sem adivinhar `/v1/models`.
+- Conhecido e aceito: `guard_host` tolera userinfo num host de loopback (`http://chave@127.0.0.1:1234/v1`), porque nada aqui conecta nessa base e a mensagem não ecoa o texto. Não acrescentar leitura/escrita de credencial a esse ramo: se um dia formos *usar* o endpoint, a chave sai de um nome de variável, como em `providers.register`.
+- O contrato `ATHENA_OLLAMA_HOST`/`SENTINEL_OLLAMA_HOST` é **do Ollama**: um provedor com caminho não pode virar esse valor (teste 8 — e é por isso que `engineinstall.consumer_env_targets`, Task 11, recusa escrever config sem provedor Ollama na config).
 
 **Files:**
-- Create: `src/thero/localep.py`
-- Modify: `src/thero/providers.py` (ramo `kind == "local"` de `register` e de `test_endpoint` + campo `ollamaFamily` em `blank_from_preset`)
-- Test: `tests/test_localep.py`, `tests/test_providers_local_non_ollama.py`
+- Create: `tests/test_providers_local_non_ollama.py`
+- Modify: nada em `src/`
 
-- [ ] **Step 1: Escrever os testes que falham**
+- [ ] **Step 1: Ler o que já existe antes de escrever qualquer coisa**
 
-`tests/test_localep.py`:
+Run: `git show 0287c92 --stat`
+Run: `python -c "from thero import localmodels; print(localmodels.has_endpoint_path('http://127.0.0.1:1234/v1'), localmodels.guard_host('http://127.0.0.1:1234/v1'))"`
+Expected: `True http://127.0.0.1:1234/v1`
 
-```python
-"""Endpoint local nao-Ollama: loopback continua sendo seguranca, nao estilo."""
+Run: `python -c "from thero import localmodels; print(localmodels.guard_base('http://127.0.0.1:1234/v1'))"`
+Expected: `ValueError: a base do Ollama nao aceita caminho: ...` — se isto **não** levantar, o veto foi afrouxado: pare e reporte.
 
-import json
-
-import pytest
-
-from thero import localep
-
-
-class Response:
-    def __init__(self, status=200, body=b"ok"):
-        self.status = status
-        self._body = body
-
-    def read(self):
-        return self._body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-class Recorder:
-    def __init__(self, response=None, error=None):
-        self.requests = []
-        self.response = response or Response()
-        self.error = error
-
-    def __call__(self, request, timeout=None):
-        self.requests.append((request, timeout))
-        if self.error:
-            raise self.error
-        return self.response
-
-
-def test_a_path_is_allowed_here_and_refused_by_the_ollama_client():
-    base = localep.guard_endpoint("http://127.0.0.1:1234/v1")
-    assert base == "http://127.0.0.1:1234/v1"
-
-
-def test_bare_host_gets_a_scheme_and_keeps_the_path():
-    assert localep.guard_endpoint("localhost:1234/v1") == (
-        "http://localhost:1234/v1")
-
-
-def test_only_the_trailing_slash_is_dropped():
-    assert localep.guard_endpoint("http://localhost:1234/v1/") == (
-        "http://localhost:1234/v1")
-
-
-@pytest.mark.parametrize("base", [
-    "http://10.0.0.5:1234/v1", "https://example.com/v1",
-    "http://127.0.0.1.evil.com/v1", "http://[::2]:1234/v1",
-    "http://ollama.exemplo:443/v1",
-])
-def test_non_loopback_is_refused(base):
-    with pytest.raises(ValueError):
-        localep.guard_endpoint(base)
-
-
-def test_a_credential_in_the_url_is_refused_without_echoing_it():
-    with pytest.raises(ValueError) as info:
-        localep.guard_endpoint("http://sk-segredo@127.0.0.1:1234/v1")
-    assert "sk-segredo" not in str(info.value)
-
-
-@pytest.mark.parametrize("base", ["file:///c:/x", "gopher://127.0.0.1/x",
-                                  "http://127.0.0.1:1234/a%27b"])
-def test_only_plain_http_on_a_clean_path_passes(base):
-    with pytest.raises(ValueError):
-        localep.guard_endpoint(base)
-
-
-def test_a_bad_port_is_refused():
-    with pytest.raises(ValueError):
-        localep.guard_endpoint("http://127.0.0.1:99999/v1")
-
-
-def test_reachable_asks_the_base_itself_and_never_invents_an_ollama_path():
-    fake = Recorder()
-    out = localep.reachable("http://127.0.0.1:1234/v1", opener=fake)
-    assert out["ok"] is True and out["status"] == 200
-    assert fake.requests[0][0].full_url == "http://127.0.0.1:1234/v1"
-    assert "/api/tags" not in fake.requests[0][0].full_url
-
-
-def test_reachable_reports_a_refused_connection_in_human_words():
-    fake = Recorder(error=OSError("connection refused"))
-    out = localep.reachable("http://127.0.0.1:1234/v1", opener=fake)
-    assert out["ok"] is False and "127.0.0.1:1234/v1" in out["error"]
-
-
-def test_reachable_refuses_a_remote_host_before_the_opener_runs():
-    fake = Recorder()
-    with pytest.raises(ValueError):
-        localep.reachable("http://api.exemplo.com/v1", opener=fake)
-    assert fake.requests == []
-```
+- [ ] **Step 2: Escrever o teste que trava o contrato**
 
 `tests/test_providers_local_non_ollama.py`:
 
 ```python
-"""Provedor local nao-Ollama: registrado sem a sonda do Ollama."""
+"""O ramo nao-Ollama que ja existe na arvore, travado por teste.
+
+Nada aqui reimplementa: `0287c92` entregou `has_endpoint_path`/`guard_host` e
+o ramo "sem sonda" de `providers.register`. Estes testes amarram as tres
+coisas que o onboarding do motor (Tasks 10-13) passa a depender, e que um
+refactor futuro poderia esquecer.
+"""
 
 import pytest
 
-from thero import localep, providers
-
-LMSTUDIO = {"id": "lmstudio", "label": "LM Studio (local)", "kind": "local",
-            "authKind": "local", "base": "http://127.0.0.1:1234/v1",
-            "transport": "OpenAI-compativel local"}
-OLLAMA = {"id": "ollama", "label": "Ollama (local)", "kind": "local",
-          "authKind": "local", "base": "http://127.0.0.1:11434",
-          "transport": "API nativa Ollama", "preset": "ollama"}
+from thero import apply, localmodels, providers
 
 
 class Boom:
@@ -1692,24 +1647,40 @@ class Boom:
         raise AssertionError("nenhuma rede era para acontecer aqui")
 
 
-@pytest.fixture
-def no_network(monkeypatch):
-    fake = Boom()
-    monkeypatch.setattr(localep, "urlopen", fake)
-    return fake
+LMSTUDIO = {"id": "lmstudio", "label": "LM Studio (local)", "kind": "local",
+            "authKind": "local", "base": "http://127.0.0.1:1234/v1",
+            "transport": "OpenAI-compativel local"}
+OLLAMA = {"id": "ollama", "label": "Ollama (local)", "kind": "local",
+          "authKind": "local", "base": "http://127.0.0.1:11434",
+          "transport": "API nativa Ollama", "preset": "ollama"}
 
 
-def test_lmstudio_registers_without_the_ollama_probe(monkeypatch, no_network):
+def test_lmstudio_registers_without_the_ollama_probe(monkeypatch):
     def explode(base):
-        raise AssertionError("a sonda do Ollama nao roda para nao-Ollama")
+        raise AssertionError("a sonda do Ollama nao roda em base com caminho")
 
     monkeypatch.setattr(providers.localmodels, "list_models", explode)
+    monkeypatch.setattr(localmodels, "urlopen", Boom())
     out = providers.register(LMSTUDIO)
-    assert out["ok"] is True
-    assert out["authState"] == "sem lista de modelos"
-    assert "sabemos que existe" in out["msg"]
-    assert "listar os modelos" in out["msg"]
-    assert no_network.calls == 0
+    assert out["ok"] is True and out["authState"] == "sem sonda"
+    assert "sabemos que ele existe" in out["msg"]
+    assert "nao sabemos listar" in out["msg"]
+
+
+def test_the_honest_message_does_not_echo_a_credential(monkeypatch):
+    monkeypatch.setattr(localmodels, "urlopen", Boom())
+    sneaky = dict(LMSTUDIO, base="http://sk-segredo@127.0.0.1:1234/v1")
+    out = providers.register(sneaky)
+    assert out["ok"] is True and "sk-segredo" not in out["msg"]
+
+
+def test_a_remote_local_base_is_still_blocked(monkeypatch):
+    fake = Boom()
+    monkeypatch.setattr(localmodels, "urlopen", fake)
+    out = providers.register(dict(LMSTUDIO,
+                                  base="http://host.exemplo.com:1234/v1"))
+    assert out["ok"] is False and out["authState"] == "bloqueado"
+    assert "loopback" in out["msg"] and fake.calls == 0
 
 
 def test_the_ollama_family_still_probes(monkeypatch):
@@ -1721,254 +1692,65 @@ def test_the_ollama_family_still_probes(monkeypatch):
 
     monkeypatch.setattr(providers.localmodels, "list_models", fake_list)
     out = providers.register(OLLAMA)
-    assert out["ok"] is True and seen["base"] == "http://127.0.0.1:11434"
+    assert out["ok"] is True
+    assert seen["base"] == "http://127.0.0.1:11434"
 
 
-def test_a_remote_local_base_is_refused_and_never_echoed(monkeypatch):
-    monkeypatch.setattr(providers.localmodels, "urlopen", Boom())
-    bad = dict(LMSTUDIO, base="http://sk-segredo@ollama.exemplo.com/v1")
-    out = providers.register(bad)
-    assert out["ok"] is False and out["authState"] == "bloqueado"
-    assert "sk-segredo" not in out["msg"]
+def test_the_ollama_client_still_refuses_a_path():
+    # A fronteira de seguranca nao afrouxou: o que mudou foi o veto de HOST
+    # para provedores que nao sao a API do Ollama.
+    with pytest.raises(ValueError):
+        localmodels.guard_base("http://127.0.0.1:11434/v1")
 
 
-def test_the_kind_normalization_still_reaches_the_veto(no_network):
-    out = providers.register(dict(LMSTUDIO, authKind=" Local ",
-                                  base="http://10.1.2.3:1234/v1"))
-    assert out["ok"] is False and "loopback" in out["msg"]
+def test_guard_host_accepts_a_loopback_path_and_nothing_else():
+    assert localmodels.guard_host("http://localhost:1234/v1") == (
+        "http://localhost:1234/v1")
+    with pytest.raises(ValueError):
+        localmodels.guard_host("http://10.0.0.5:1234/v1")
 
 
-def test_test_endpoint_says_what_it_cannot_do(no_network):
-    out = providers.test_endpoint(LMSTUDIO)
-    assert out["ok"] is True and no_network.calls == 0
-    assert "127.0.0.1:1234/v1" in out["msg"]
-    assert "nao sabemos listar" in out["msg"]
+def test_has_endpoint_path_is_a_pure_url_question(monkeypatch):
+    fake = Boom()
+    monkeypatch.setattr(localmodels, "urlopen", fake)
+    assert localmodels.has_endpoint_path("http://127.0.0.1:1234/v1")
+    assert not localmodels.has_endpoint_path("http://127.0.0.1:11434")
+    assert localmodels.has_endpoint_path("http://127.0.0.1:11434?x=1")
+    assert fake.calls == 0   # nenhum pedido: e so urlparse
 
 
-def test_the_lmstudio_base_never_reaches_the_ollama_env_contract():
-    # ATHENA_/SENTINEL_OLLAMA_HOST sao contratos DO Ollama: um provedor com
-    # path (/v1) nao pode virar o host dos consumidores.
-    assert providers._ollama_family(LMSTUDIO) is False
-    assert providers._ollama_family(OLLAMA) is True
-    blank = providers.blank_from_preset("ollama", taken=())
-    assert blank["ollamaFamily"] is True
+def test_a_non_ollama_provider_never_becomes_the_consumers_host():
+    # ATHENA_/SENTINEL_OLLAMA_HOST sao contratos DO Ollama.
+    # `apply._ollama_base` casa preset/id == "ollama"; sem ele, devolve o
+    # padrao 11434 -- nunca o /v1 do LM Studio. E por isso que
+    # `consumer_env_targets` (Task 11) recusa
+    # escrever a $PROFILE sem provedor Ollama na config.
+    cfg = {"providers": [LMSTUDIO]}
+    assert apply._ollama_base(cfg) == "http://127.0.0.1:11434"
+    assert localmodels.has_endpoint_path(LMSTUDIO["base"])
 ```
 
-- [ ] **Step 2: Rodar para ver falhar**
+- [ ] **Step 3: Rodar**
 
-Run: `python -m pytest tests/test_localep.py tests/test_providers_local_non_ollama.py -q`
-Expected: FAIL — `ModuleNotFoundError: No module named 'thero.localep'`
-
-- [ ] **Step 3: Escrever `localep.py`**
-
-`src/thero/localep.py`:
-
-```python
-"""Endpoints locais que NAO sao o Ollama (LM Studio, llama.cpp, outros).
-
-O veto de `localmodels._assert_loopback` continua igual e nao e tocado: ele
-recusa path porque o cliente do Ollama monta `/api/tags` em cima de uma base
-seca -- limitacao de transporte, nao permissao de seguranca. Aqui a
-seguranca e a mesma (http/https + host de loopback + nenhuma credencial na
-URL); o que muda e que path e permitido, e a lista de modelos simplesmente
-nao existe para nos.
-
-Regra explicita: nada aqui sabe o que e um `/v1/models`, `/api/tags` ou
-qualquer outra rota. Quem precisa de conversa de modelo e o consumidor (o
-Sentinel ja fala com servidor OpenAI-compativel por conta propria).
-
-Proibido print(): modulo do processo da ponte. Nenhuma variavel de ambiente
-lida: o endpoint vem do que o usuario digitou na tela.
-"""
-
-from __future__ import annotations
-
-import re
-import urllib.request
-from urllib.parse import urlparse
-
-from thero.settings import OLLAMA_PROBE_TIMEOUT
-
-urlopen = urllib.request.urlopen   # costura de teste, mesmo padrao do repo
-
-_SCHEMES = ("http", "https")
-# O netloc COMPLETO (host + porta opcional), como no cliente do Ollama: o
-# `hostname` do urlparse corta no primeiro ":" e um sufixo malicioso passaria.
-_LOOPBACK = re.compile(
-    r"(\[?(127\.0\.0\.1|localhost|::1)\]?)(:[0-9]{1,5})?\Z", re.IGNORECASE)
-_PATH_OK = re.compile(r"^/[A-Za-z0-9._~/?&=+%-]{0,200}\Z")
-
-
-def normalize(base: object) -> str:
-    """Da o scheme quando falta e so corta a "/" final -- path e parte do
-    endpoint de um servidor OpenAI-compativel (`/v1`), nao sobra de URL."""
-    raw = str(base or "").strip()
-    if not raw:
-        raise ValueError("informe o endpoint local antes de registrar")
-    if "://" not in raw:
-        raw = "http://" + raw
-    return raw.rstrip("/")
-
-
-def guard_endpoint(base: object) -> str:
-    """Loopback, http(s), sem userinfo, path limpo. Ou ValueError sem eco."""
-    url = normalize(base)
-    parsed = urlparse(url)
-    if parsed.scheme not in _SCHEMES:
-        raise ValueError("endpoint local precisa ser http ou https")
-    if parsed.username or parsed.password:
-        # Um `http://chave@host` pode SER a credencial colada no campo errado:
-        # o texto da excecao nao repete nada da URL (mesma regra de
-        # `providers.register`).
-        raise ValueError("endpoint local nao leva credencial na URL")
-    try:
-        parsed.port  # porta fora de 0..65535 -> ValueError, igual ao Ollama
-    except ValueError:
-        raise ValueError("porta de endpoint local inesperada")
-    if _LOOPBACK.match(parsed.netloc) is None:
-        raise ValueError("apenas loopback e permitido para modelos locais")
-    if parsed.query or parsed.fragment:
-        raise ValueError("o endpoint local nao aceita consulta nem fragmento")
-    if parsed.path and not _PATH_OK.match(parsed.path):
-        raise ValueError("o caminho do endpoint local nao e aceitavel")
-    return url
-
-
-def reachable(base: object, *, opener=None,
-              timeout=OLLAMA_PROBE_TIMEOUT) -> dict:
-    """Existe algo respondendo naquela URL? NAO pergunta modelos, nao inventa
-    rota: um GET na base que o usuario digitou, com o teto curto da sonda."""
-    url = guard_endpoint(base)
-    out = {"ok": False, "status": 0, "error": ""}
-    request = urllib.request.Request(url, method="GET")
-    try:
-        with (opener or urlopen)(request, timeout=timeout) as response:
-            out["status"] = int(getattr(response, "status", 200) or 0)
-        out["ok"] = 200 <= out["status"] < 500
-        if not out["ok"]:
-            out["error"] = "o endpoint respondeu %d" % out["status"]
-    except OSError as exc:
-        # OSError ja cobre URLError/HTTPError/socket.timeout (ValueError so
-        # existe no int() acima, fora daqui).
-        out["error"] = "nao consegui falar com %s: %s" % (url, exc)
-    return out
-```
-
-- [ ] **Step 4: Ligar no `providers.py` sem tocar no caminho do Ollama**
-
-Em `src/thero/providers.py`:
-
-a) import — linha `from thero import localmodels, presets` vira:
-
-```python
-from thero import localmodels, localep, presets
-```
-
-b) logo abaixo de `AUTH_KINDS`, acrescentar o classificador (é a única fonte da pergunta "este provedor fala a língua do Ollama?"):
-
-```python
-# Familia Ollama = sobre o que sabemos perguntar `/api/tags`. Em vez de
-# adivinhar pelo preset (o usuario digita a maquina), perguntamos ao cliente:
-# `guard_base` recusa path, entao uma base que passa nele e, por definicao,
-# uma base de Ollama. Um LM Studio em `/v1` cai no outro ramo sozinho.
-def _ollama_family(provider: dict) -> bool:
-    base = str((provider or {}).get("base") or "").strip()
-    if not base:
-        return False
-    try:
-        localmodels.guard_base(base)
-    except ValueError:
-        return False
-    return True
-```
-
-c) dentro de `register`, **substituir o bloco** `if kind == "local": ...` inteiro pela versão abaixo (o resto da função fica byte a byte como está hoje):
-
-```python
-    if kind == "local":
-        base = provider.get("base", "")
-        if not base:
-            return {"ok": False, "authState": "incompleto",
-                    "msg": "informe o endpoint local antes de registrar"}
-        if not _ollama_family(provider):
-            # Servidor OpenAI-compativel na maquina: validamos o loopback,
-            # registramos SEM a sonda do Ollama e dizemos o que nao sabemos.
-            try:
-                localep.guard_endpoint(base)
-            except ValueError:
-                return {"ok": False, "authState": "bloqueado",
-                        "msg": "modelos locais so por loopback: %s" % safe}
-            return {"ok": True, "authState": "sem lista de modelos",
-                    "msg": "endpoint local registrado: sabemos que existe, "
-                           "mas nao sabemos listar os modelos dele"}
-        try:
-            url_base = localmodels.guard_base(base)
-        except ValueError as exc:
-            # O texto da excecao cita a base crua (recebi %r): mesma redacao
-            # de _redact usada em test_endpoint, sem duplicar a regex.
-            return {"ok": False, "authState": "bloqueado",
-                    "msg": "modelos locais so por loopback: %s"
-                           % _redact(exc)}
-        probe = localmodels.list_models(url_base)
-        if probe["ok"]:
-            return {"ok": True, "authState": "respondeu",
-                    "msg": "endpoint local respondeu - provedor registrado"}
-        return {"ok": False, "authState": "sem resposta",
-                "msg": "registrado, mas o endpoint nao respondeu agora"}
-```
-
-Como `register` não tem `base`/`safe` no topo hoje (só `test_endpoint` tem), acrescente as duas linhas **imediatamente depois** do veto de `AUTH_KINDS` (`if kind not in AUTH_KINDS: ...`), antes do ramo `session`:
-
-```python
-    base = str(provider.get("base") or "")
-    # A base pode carregar credencial no userinfo: todo texto que sai daqui
-    # com ela sai redigido (mesma regra que ja vale para `authVar`).
-    safe = _redact(base)
-```
-
-e troque, dentro do ramo `local`, a linha `base = provider.get("base", "")` por nada (a variável já existe acima). O restante da função (session, apikey) fica byte a byte como está.
-
-d) dentro de `test_endpoint`, no ramo `kind == "local"`, inserir **antes** do `try: url_base = localmodels.guard_base(base)`:
-
-```python
-        if not _ollama_family(provider):
-            try:
-                endpoint = localep.guard_endpoint(base)
-            except ValueError:
-                return {"ok": False,
-                        "msg": "modelos locais so por loopback: %s" % safe}
-            return {"ok": True,
-                    "msg": "%s - sabemos que existe, mas nao sabemos listar "
-                           "os modelos dele" % _redact(endpoint)}
-```
-
-e) em `blank_from_preset`, no dict devolvido, acrescentar a chave para o formulário futuro não adivinhar:
-
-```python
-        "ollamaFamily": _ollama_family({"base": pre.get("base", "")}),
-```
-
-- [ ] **Step 5: Rodar para ver passar (novos + regressão do caminho Ollama)**
-
-Run: `python -m pytest tests/test_localep.py tests/test_providers_local_non_ollama.py tests/test_providers.py -q`
-Expected: `78 passed` (16 itens em `test_localep.py` — 10 funções, duas parametrizadas com 5 e 3 casos; 6 em `test_providers_local_non_ollama.py`; 56 já existentes em `tests/test_providers.py`, **sem** mudar nenhum teste antigo)
+Run: `python -m pytest tests/test_providers_local_non_ollama.py tests/test_providers.py tests/test_localmodels.py -q`
+Expected: `99 passed` (8 novos + 59 de `tests/test_providers.py` + 32 de `tests/test_localmodels.py`, números medidos hoje nesta árvore; conte **delta de 8**, se os antigos tiverem mudado. Se algum teste antigo falhar, você tocou em `src/` e deve reverter)
 
 Run: `python -m pytest tests/ -q`
-Expected: `498 passed`
+Expected: `B + 68` passed
 
-- [ ] **Step 6: Confirmar que `localmodels` não mudou**
+- [ ] **Step 4: Provar que `src/` não foi tocado nesta task**
 
-Run: `git diff --stat src/thero/localmodels.py`
-Expected: saída **vazia**. Se não estiver vazia, você afrouxou o veto — reverta e refaça no `localep.py`.
+Run: `git status --short src/`
+Expected: saída **vazia**.
 
-- [ ] **Step 7: Commit local**
+- [ ] **Step 5: Commit local**
 
 ```bash
-git add src/thero/localep.py src/thero/providers.py tests/test_localep.py tests/test_providers_local_non_ollama.py
-git commit -m "feat(providers): local nao-Ollama registrado sem a sonda do Ollama"
+git add tests/test_providers_local_non_ollama.py
+git commit -m "test(providers): amarra o ramo local sem sonda que a arvore ja entrega"
 ```
 
-**Contagem acumulada: 498.**
+**Acumulado: B + 68.**
 
 ---
 
@@ -2507,7 +2289,7 @@ Run: `python -m pytest tests/test_engineinstall_plan.py -q`
 Expected: `15 passed`
 
 Run: `python -m pytest tests/ -q`
-Expected: `513 passed`
+Expected: `B + 83` passed
 
 - [ ] **Step 5: Commit local**
 
@@ -2516,7 +2298,7 @@ git add src/thero/engineinstall.py tests/test_engineinstall_plan.py
 git commit -m "feat(engineinstall): retrato e plano com tamanho, consentimento e idempotencia"
 ```
 
-**Contagem acumulada: 513.**
+**Acumulado: B + 83.**
 
 ---
 
@@ -3078,7 +2860,7 @@ Run: `python -m pytest tests/test_engineinstall_steps.py -q`
 Expected: `21 passed`
 
 Run: `python -m pytest tests/ -q`
-Expected: `534 passed`
+Expected: `B + 104` passed
 
 - [ ] **Step 5: Commit local**
 
@@ -3087,7 +2869,7 @@ git add src/thero/engineinstall.py tests/test_engineinstall_steps.py
 git commit -m "feat(engineinstall): passos isolados com a posse do processo travada"
 ```
 
-**Contagem acumulada: 534.**
+**Acumulado: B + 104.**
 
 ---
 
@@ -3522,7 +3304,7 @@ Run: `python -m pytest tests/test_engineinstall_execute.py -q`
 Expected: `16 passed`
 
 Run: `python -m pytest tests/ -q`
-Expected: `550 passed`
+Expected: `B + 120` passed
 
 Assinaturas que estes testes fixam (a Task 12 não pode quebrá-las ao ajustar detalhes): `deps` aceita exatamente as chaves de `DEP_KEYS`; `download`/`verify` só com as keywords mostradas; `launch(path)` posicional; `wait(base=...)`; `pull(name, base=..., progress=...)`; `env(cfg, seen=...)`; `artifactcheck.check(path=, expected_sha256=)` da Task 7; `download.to_file(url=, name=, workdir=, expected_sha256=, total_bytes=, progress=)` da Task 8.
 
@@ -3533,7 +3315,7 @@ git add src/thero/engineinstall.py tests/test_engineinstall_execute.py
 git commit -m "feat(engineinstall): execute com consentimento, progresso e replanejamento"
 ```
 
-**Contagem acumulada: 550.**
+**Acumulado: B + 120.**
 
 ---
 
@@ -3565,7 +3347,7 @@ import pytest
 from thero import engineinstall
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "thero"
-MODULES = ("enginedata.py", "artifactcheck.py", "download.py", "localep.py",
+MODULES = ("enginedata.py", "artifactcheck.py", "download.py",
            "engineinstall.py")
 # Pecas que a Task 13 conhece e perdoa por serem elas mesmas a costura.
 SEAM_HELPERS = {"_run_installer"}
@@ -3636,8 +3418,7 @@ def test_every_network_and_process_call_site_has_an_injectable_seam():
 
 def test_the_only_subprocess_entry_point_is_the_guarded_installer():
     offenders = []
-    for name in ("engineinstall.py", "download.py", "localep.py",
-                 "enginedata.py"):
+    for name in ("engineinstall.py", "download.py", "enginedata.py"):
         for function in _functions(_tree(name)):
             for node in ast.walk(function):
                 if (isinstance(node, ast.Attribute)
@@ -3727,7 +3508,7 @@ Run: `python -m pytest tests/test_engineinstall_invariants.py tests/test_enginei
 Expected: `65 passed` (13 + 15 + 21 + 16)
 
 Run: `python -m pytest tests/ -q`
-Expected: `563 passed`
+Expected: `B + 133` passed
 
 - [ ] **Step 5: Commit local**
 
@@ -3736,7 +3517,7 @@ git add src/thero/engineinstall.py tests/test_engineinstall_invariants.py
 git commit -m "feat(engineinstall): advice de remocao e invariantes de canal provadas por AST"
 ```
 
-**Contagem acumulada: 563.**
+**Acumulado: B + 133.**
 
 ---
 
@@ -3781,7 +3562,7 @@ na `$PROFILE`, delimitado por `# >>> thero env >>>` / `# <<< thero env <<<`.
 - [ ] **Step 2: Rodar a suíte (README não quebra nada, mas a regra é medir)**
 
 Run: `python -m pytest tests/ -q`
-Expected: `563 passed`
+Expected: `B + 133` passed
 
 - [ ] **Step 3: Commit local**
 
@@ -3790,7 +3571,7 @@ git add README.md
 git commit -m "docs(README): fronteira entre instalar o motor e ser dono do processo"
 ```
 
-**Contagem acumulada: 563.**
+**Acumulado: B + 133.**
 
 ---
 
@@ -3799,7 +3580,7 @@ git commit -m "docs(README): fronteira entre instalar o motor e ser dono do proc
 - [ ] **Step 1: Suíte completa**
 
 Run: `python -m pytest tests/ -q`
-Expected: `563 passed` (número real da máquina; se divergir da cadeia acima, **reescreva a cadeia** com os números medidos, não force os testes)
+Expected: `B + 133` passed, com `B` da Task 0 (o número absoluto da máquina vai ser outro quando você executar — o que vale é o delta: 133 testes novos, nenhuma falha nova)
 
 Run: `python -m pytest tests/ -q -m "not live" --collect-only 2>&1 | tail -2`
 Expected: mesma contagem — nenhum teste deste plano é `live`.
@@ -3813,7 +3594,7 @@ python - <<'PY'
 import ast, pathlib
 src = pathlib.Path("src/thero")
 for name in ("enginedata.py", "artifactcheck.py", "download.py",
-             "localep.py", "engineinstall.py"):
+             "engineinstall.py"):
     text = (src / name).read_text(encoding="utf-8")
     hits = [flag for flag in ("subprocess", "urlopen", "urllib.request")
             if flag in text]
@@ -3832,7 +3613,7 @@ Run:
 git diff --name-only HEAD~9..HEAD
 ```
 
-Expected: apenas `README.md`, `src/thero/{enginedata,artifactcheck,download,localep,providers,engineinstall}.py`, `tests/test_{enginedata,artifactcheck,download,localep,providers_local_non_ollama,engineinstall_*}.py` e este plano. Se `localmodels.py`, `apply.py`, `bridge.py`, `gui/*` ou qualquer arquivo fora de `thero/` aparecer na lista, **pare e pergunte ao dono** — isso violou a seção 6.
+Expected: apenas `README.md`, `src/thero/{enginedata,artifactcheck,download,engineinstall}.py`, `tests/test_{enginedata,artifactcheck,download,providers_local_non_ollama,engineinstall_*}.py` e este plano. Se `localmodels.py`, `apply.py`, `providers.py`, `bridge.py`, `gui/*` ou qualquer arquivo fora de `thero/` aparecer na lista, **pare e pergunte ao dono** — isso violou a seção 6 (e, no caso de `providers.py`/`localmodels.py`, possivelmente o trabalho de outro agente).
 
 - [ ] **Step 4: Commit local final (se sobrou algo)**
 
@@ -3858,7 +3639,7 @@ Expected: vazio, ou apenas os arquivos deste plano aguardando o "ok" do dono par
 | Idempotência e recomeço | 8 (`.part` + `os.replace`; arquivo íntegro já presente não rebaixa), 10 (re-observar), 12 (re-plan após o motor subir; teste `test_a_second_execute_...`); "motor existe → parar e perguntar" no `stopAndAsk` da Task 10 |
 | Dono do quê (tabela ação/fazemos/não fazemos) | Seção 2, aplicada nas tasks 6-13 |
 | Desinstalação é ação do usuário | 13 (`advice()` + proibição AST de primitivas de remoção) |
-| LM Studio sem afrouxar o veto | 9 (`localep.py`, registro sem sonda Ollama, mensagem honesta redigida por `providers.redact`; `localmodels._assert_loopback` intacto — provado no Step 6) |
+| LM Studio sem afrouxar o veto | 9 — **já entregue por outro agente** (`0287c92`: `guard_host`/`has_endpoint_path`/`authState "sem sonda"`); a Task 9 deste plano trava o contrato por teste e prova que `guard_base` continua recusando caminho |
 | Dependência da ponte | Seção 4 + `progress`/`consent`/`stream_model` (Tasks 11-12), sem tocar em `bridge.py`/`gui/*` |
 
 **Fora deste plano (declarado, não esquecido):** worker/cancelamento e barra de progresso na GUI (ponte); validação de host no lado da Athena (o veto continua morando em `apply`/`localmodels`/`engineinstall`, e a Athena lê sem validar — Pergunta 3); provedor MCP/CLI para "instalar motor" (a CLI é o caminho do terminal e não foi pedida); remoção programática do bloco da `$PROFILE` (o `advice()` da Task 13 aponta os marcadores e o usuário decide).
@@ -3867,11 +3648,13 @@ Expected: vazio, ou apenas os arquivos deste plano aguardando o "ok" do dono par
 
 ## Auto-revisão
 
-**1. Cobertura do prescrito.** Ver a tabela da seção 8: os cinco itens da espinha dorsal, as sete frentes de escopo do enunciado e as regras por task (seção 5) têm task correspondente. Dois itens viram **task de descoberta** em vez de afirmação: endereço/nome/flags da instalação (Tasks 1, 3) e tamanho/modelo/pasta/disco (Tasks 4, 5). O que eu **verifiquei nesta sessão** e escrevi como fato com fonte: baseline 416, ausência do binário, presença de 13,67 GB de blobs sem motor, redirecionamento com expiração do instalador, existência e formato do `sha256sum.txt`, formato de saída do `Get-AuthenticodeSignature`, as duas armadilhas do PowerShell (`$args[0]`, codepage), espaço livre do `C:` e os tamanhos anunciados de `llama3.2`/`qwen3-coder-next`.
+**1. Cobertura do prescrito.** Ver a tabela da seção 8: os cinco itens da espinha dorsal, as sete frentes de escopo do enunciado e as regras por task (seção 5) têm task correspondente. Dois itens viram **task de descoberta** em vez de afirmação: endereço/nome/flags da instalação (Tasks 1, 3) e tamanho/modelo/pasta/disco (Tasks 4, 5). O que eu **verifiquei nesta sessão** e escrevi como fato com fonte: baseline (416 no início, 442/444 com a árvore em movimento, por isso a cadeia é `B + k` e existe a Task 0), ausência do binário, presença de 13,67 GB de blobs sem motor, redirecionamento com expiração do instalador, existência e formato do `sha256sum.txt`, formato de saída do `Get-AuthenticodeSignature`, as duas armadilhas do PowerShell (`$args[0]`, codepage), espaço livre do `C:` e os tamanhos anunciados de `llama3.2`/`qwen3-coder-next`.
 
-**2. Placeholders.** Nenhum "TODO"/"tratar erros"/"similar à Task N". Onde a incerteza é real, existe comando para rodar e um local onde o resultado entra (seção 12). Os três pontos genuinamente indisponíveis hoje estão **marcados como PENDENTE com o teste que continua passando nos dois ramos**: flag silenciosa do instalador (`INSTALLER_ARGS = ()` + teste da Task 6 cobre ambos os casos), tamanho de `qwen2.5-coder:14b` (o `plan()` tem ramo `unknownSizes` + teste na Task 10), e formato da linha de progresso (o `percent_from_line` trata com e sem `%`, testado na Task 11). Dois trechos do plano contêm **correção explícita logo abaixo do bloco** (o helper `get` em `tests/test_download.py` e os ajustes de contagem): são instruções de execução, não buracos — aplique a versão corrigida.
+**1b. O que a revisão cortou.** A versão inicial deste plano prescrevia um módulo `localep.py`, um campo `ollamaFamily` e um arquivo de estado `engine-state.json`. Os três foram cortados na revisão: o requisito do LM Studio já estava entregue em `0287c92` (`has_endpoint_path` + `guard_host` + `authState "sem sonda"`) e a idempotência é toda de re-observação da máquina, sem estado nosso. A Task 9 virou task de **verificação com teste de contrato**, não de construção.
 
-**3. Consistência de assinaturas entre tasks.** `artifactcheck.check(path=, expected_sha256=, runner=)` (Task 7) é a chamada que a Task 12 faz via `deps["verify"]`; `download.to_file(url, name, workdir, *, expected_sha256, total_bytes, progress, opener, max_bytes)` (Task 8) é a chamada de `deps["download"]` na Task 12 com as mesmas keywords testadas em `test_execute_passes_the_download_keywords_the_downloader_expects`; `enginedata.checksums_url(tag)` (Task 6) é a única forma de montar a URL da Task 11 (`release_info`), e o teste `test_an_untrusted_tag_never_becomes_a_url` amarra os dois; `engineinstall.plan(portrait=, want=, free_bytes=, on_disk=)` (Task 10) é a mesma chamada do re-planejamento na Task 12; `write_consumer_env(cfg, *, profile, want, seen, apply_fn)` (Task 11) é a mesma de `deps["env"]` (Task 12, chamada `(cfg, seen=seen)`); `providers._ollama_family` (Task 9) é o único classificador usado na tela e na mensagem, e a regra de "provedor Ollama" de `consumer_env_targets` (Task 11) é declaradamente a mesma de `apply._ollama_base`. As contagens acumuladas partem do **416 medido**, não do 400 citado no enunciado.
+**2. Placeholders.** Nenhum "TODO"/"tratar erros"/"similar à Task N". Onde a incerteza é real, existe comando para rodar e um local onde o resultado entra (seção 12). Os três pontos genuinamente indisponíveis hoje estão **marcados como PENDENTE com o teste que continua passando nos dois ramos**: flag silenciosa do instalador (`INSTALLER_ARGS = ()` + teste da Task 6 cobre ambos os casos), tamanho de `qwen2.5-coder:14b` (o `plan()` tem ramo `unknownSizes` + teste na Task 10), e formato da linha de progresso (o `percent_from_line` trata com e sem `%`, testado na Task 11). Nenhum bloco de código do plano depende de correção posterior: o helper `get` de `tests/test_download.py` já está na forma que os chamadores usam (`tmp_path=` como workdir).
+
+**3. Consistência de assinaturas entre tasks.** `artifactcheck.check(path=, expected_sha256=, runner=)` (Task 7) é a chamada que a Task 12 faz via `deps["verify"]`; `download.to_file(url, name, workdir, *, expected_sha256, total_bytes, progress, opener, max_bytes)` (Task 8) é a chamada de `deps["download"]` na Task 12 com as mesmas keywords testadas em `test_execute_passes_the_download_keywords_the_downloader_expects`; `enginedata.checksums_url(tag)` (Task 6) é a única forma de montar a URL da Task 11 (`release_info`), e o teste `test_an_untrusted_tag_never_becomes_a_url` amarra os dois; `engineinstall.plan(portrait=, want=, free_bytes=, on_disk=)` (Task 10) é a mesma chamada do re-planejamento na Task 12; `write_consumer_env(cfg, *, profile, want, seen, apply_fn)` (Task 11) é a mesma de `deps["env"]` (Task 12, chamada `(cfg, seen=seen)`); `localmodels.has_endpoint_path`/`guard_host` (Task 9, já embarcados) sao os unicos classificadores usados na tela, e a regra de "provedor Ollama" de `consumer_env_targets` (Task 11) e declaradamente a mesma de `apply._ollama_base` (preset/id == "ollama") - o teste 8 da Task 9 prova que o `/v1` do LM Studio nunca vira `ATHENA_OLLAMA_HOST`. Nao existem mais `localep.py` nem `providers._ollama_family` neste plano: ambos foram cortados na revisao porque a arvore ja tinha entrega equivalente. As contagens sao deltas de `B` (Task 0), nao numeros absolutos: o 416 que medi no inicio ja e 442/444 com o trabalho dos outros agentes.
 
 ---
 
@@ -3885,7 +3668,7 @@ Expected: vazio, ou apenas os arquivos deste plano aguardando o "ok" do dono par
 
 4. **`OLLAMA_HOST` existe no ambiente da máquina: obedecer ou ignorar?** Regra do projeto diz "não ler valor de variável de ambiente", e a Athena lê `OLLAMA_HOST` para apontar para outro servidor. Aplicado: o host **não** vem do ambiente — vem do provedor Ollama em `config.json`, sempre validado como loopback (Task 10, `probe`/`plan`), e `OLLAMA_HOST` é apenas citada no texto de diagnóstico (Task 13). Recomendação: manter ignorando (loopback fixo = invariante), ou aceitar uma exceção estreita: ler `OLLAMA_HOST` **só** para diagnosticar e nunca para escrever config.
 
-5. **LM Studio: o dono quer que ele funcione, mas ele não atende pelos contratos `*_OLLAMA_HOST`.** Aplicado: Task 9 registra o endpoint local não-Ollama sem a sonda Ollama, com a mensagem honesta "sabemos que existe, mas não sabemos listar os modelos dele" (redigida por `providers.redact`), e o veto de loopback intacto. ~~provado por `git diff` vazio em `localmodels.py`~~ — **isto mudou depois de escrito**: `0287c92` já embarcou a metade de registro/sonda em `localmodels.py` + `providers.py` (com `guard_base` continuando recusar caminho, contrato observável igual); o que sobra para a Task 9 é o `localep.py` com a sonda de presença e o campo `ollamaFamily`. Ver a nota na própria Task 9. Não fiz o LM Studio virar Ollama nem afrouxei host. Recomendação: manter; o Athena/Sentinel continuam consumindo Ollama, e se ele quiser Athena sobre LM Studio é trabalho no `athena/` (fora deste plano).
+5. **LM Studio: o dono quer que ele funcione, mas ele não atende pelos contratos `*_OLLAMA_HOST`.** Aplicado: o registro sem a sonda Ollama **já está na árvore** (`0287c92`), com a mensagem honesta "sabemos que ele existe, nao sabemos listar os modelos dele" e o veto de host intacto (`guard_base` continua recusando caminho). A Task 9 foi reescrita para **não duplicar**: ela só trava o contrato por teste (inclusive `apply._ollama_base` nunca devolver o `/v1` do LM Studio). Não fiz o LM Studio virar Ollama nem afrouxei host. Recomendação: manter; o Athena/Sentinel continuam consumindo Ollama, e se ele quiser Athena sobre LM Studio é trabalho no `athena/` (fora deste plano).
 
 6. **Onboard via linha de comando (terminal) ou só pela janela?** Aplicado: este plano não cria comando de CLI nem toca na ponte em construção; entrega as funções do motor com callback (`execute`, `stream_model`, `plan`) de forma que a ponte consuma depois (seção 4). Recomendação: ao terminar a ponte, o dono decide se a CLI (`--engine-plan`/`--engine-install`) também expõe o fluxo — uma task de ~30 minutos depois.
 
@@ -3894,6 +3677,15 @@ Expected: vazio, ou apenas os arquivos deste plano aguardando o "ok" do dono par
 8. **Aflag "verificar disco antes de perguntar": o piso de folga é 10 GB.** Aplicado: `DISK_RESERVE_GIB = 10.0` na Task 6, usado no `plan()` (Task 10). Recomendação: manter 10 GB (o Ollama descompacta blobs e o Windows precisa de respiradouro); se ele quiser 20/50, é trocar a constante.
 
 9. **Dependência com o plano do time.** O `2026-09-28-registro-de-equipe.md` referencia `plan: onboarding-motor-local` como inexistente — este arquivo é ele. Não editei aquele plano (está em trabalho de outro agente). Recomendação: ao fechar este, o dono manda atualizar a referência cruzada; nenhuma task daqui depende do time.
+
+10. **Outro trabalho na mesma árvore está iniciando o `ollama serve` como processo desanexado nosso.** Li hoje `src/thero/engineproc.py` (não commitado): `start()`/`restart()` com `Popen([binary, "serve"], DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)` e `OLLAMA_START_WAIT` em `settings.py`. Isso é o oposto do item 2 da espinha dorsal, não importa o comentário dizendo que "não somos o serviço". Aplicado neste plano: nenhuma task daqui chama `engineproc`, o `wait_for_engine` **observa** e pede ao usuário que abra o Ollama, e `assert_not_lifecycle` continua vetando `serve` em qualquer argv que gerarmos. Recomendação: ou o dono revoga a própria regra (e escreve isso no plano da ponte, com o motivo — ex.: "start em demanda do binário que **o usuário** instalou, sem servir de hosted service"), ou o `engineproc` é cortado para `status`/`stop`=nada e a ponte passa a só reportar "motor parado, abra-o". **Não decidi por ele**: nada neste plano depende daquele módulo.
+  **Resolvida pelo dono, e a revogação está escrita** (seção 1.1 deste arquivo,
+  com a frase literal dele: *"precisamos apenas checar o status e iniciar ou
+  mesmo reiniciar caso necessario (o ollama)"*). O `engineproc.py` da ponte é o
+  caminho consentido — filho desanexado, sem handle guardado, gatilho só por
+  clique — e a `assert_not_lifecycle` deste plano continua vetando `serve` nos
+  argv **destes** módulos, que é o escopo que ela sempre teve (`MODULES`,
+  Task 13). Não cortar o módulo, não reabrir a pergunta.
 
 ---
 

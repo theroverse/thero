@@ -52,6 +52,13 @@ OLLAMA_PROBE_TIMEOUT = 3
 # read, nao a duracao total do download): um modelo de varios GB passa pelas
 # fases `verifying sha256`/`writing blob` sem emitir bytes por minutos.
 OLLAMA_PULL_TIMEOUT = 1800
+# Segundos esperando o daemon responder DENTRO do pedido de start.
+# Curto porque `ollama serve` e single-thread: cada segundo aqui e a
+# janela sem atender o proximo pedido (o ReadLine() do host fica
+# parado). Acabou o teto sem subir, a resposta diz `pending` e a tela
+# re-consulta no proximo clique -- sem worker aqui (decisao do dono:
+# worker so no caminho de baixa).
+OLLAMA_START_WAIT = 6
 
 # delete e mutacao, nao sonda: o unlink de blobs de GB passa dos 3 s da sonda.
 OLLAMA_DELETE_TIMEOUT = 30
