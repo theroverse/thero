@@ -28,10 +28,6 @@ COMMAND_MARKER_END = "# <<< setup_claude global command <<<"
 # conftest faz monkeypatch do HOME DEPOIS do import.
 THERO_DIR = Path.home() / ".thero"
 
-CONFIG_FILENAME = "config.json"
-
-CONFIG_PATH = THERO_DIR / CONFIG_FILENAME
-
 # Skills vivem no territorio do Claude Code (mesma base do instalador);
 # a quarentena das removidas fica na pasta do Thero.
 SKILLS_BASE_GLOBAL = CLAUDE_DIR / "skills"

@@ -18,7 +18,7 @@ def test_load_missing_file_returns_defaults(tmp_path):
 def test_load_corrupt_file_returns_defaults_instead_of_crashing(tmp_path):
     p = tmp_path / "config.json"
     p.write_text("{ isto nao e json", encoding="utf-8")
-    assert config.load(p)["version"] == config.CONFIG_VERSION
+    assert config.load(p) == config.default_config()
 
 
 def test_save_then_load_roundtrip_keeps_accents(tmp_path):
@@ -29,12 +29,22 @@ def test_save_then_load_roundtrip_keeps_accents(tmp_path):
     assert config.load(p)["providers"][0]["label"] == "Ômega — local"
 
 
-def test_save_writes_no_bom(tmp_path):
-    # memoria: config JSON com BOM quebra json.loads estrito no Windows
+def test_save_creates_the_directory_when_absent(tmp_path):
+    # a primeira gravacao na maquina do usuario e exatamente esse caso:
+    # ~/.thero ainda nao existe
+    p = tmp_path / ".thero" / "config.json"
+    config.save(config.default_config(), path=p)
+    assert p.exists()
+
+
+def test_save_writes_no_bom_and_leaves_no_temp_file(tmp_path):
+    # memoria: config JSON com BOM quebra json.loads estrito no Windows.
+    # a gravacao e atomica (tmp + os.replace), entao nao pode sobrar sobra.
     p = tmp_path / "config.json"
     config.save(config.default_config(), path=p)
     assert not p.read_bytes().startswith(b"\xef\xbb\xbf")
     json.loads(p.read_text(encoding="utf-8"))  # nao pode lancar erro
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_load_tolerates_a_bom_on_disk(tmp_path):

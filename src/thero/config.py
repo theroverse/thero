@@ -1,9 +1,12 @@
 """Store de `~/.thero/config.json`: o que o usuario parametrizou na interface.
 
 Regras que ja custaram tempo nesta maquina: ler com `utf-8-sig` (Set-Content
-do PowerShell escreve BOM e o `json.loads` estrito morre), escrever SEM BOM, e
-nunca perder escolha do usuario ao evoluir o schema -- merge chave a chave
-sobre os defaults, chave desconhecida preservada.
+do PowerShell escreve BOM e o `json.loads` estrito morre), escrever SEM BOM e
+escrever atomico (arquivo meio gravado + o fallback de corrompido viram
+perda de escolha), e nao perder escolha do usuario ao evoluir o schema -- as
+chaves de topo sao sobrepostas aos defaults, chave desconhecida preservada.
+Campos novos DENTRO de uma entrada de `providers`/`agents` nao sao injetados:
+quem consome essas listas le com `.get()` e default proprio.
 """
 
 from __future__ import annotations
@@ -59,10 +62,13 @@ def save(cfg: dict, path: Optional[Path] = None) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(cfg)
     payload["version"] = CONFIG_VERSION
-    target.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    # Escrita atomica: `load()` devolve os defaults para arquivo corrompido,
+    # entao uma gravacao interrompida no meio custaria as escolhas do usuario
+    # na proxima abertura. os.replace() e atomico no Windows e no POSIX, 3.9+.
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(str(tmp), str(target))
     return target
 
 
