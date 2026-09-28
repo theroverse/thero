@@ -166,8 +166,25 @@ def _unique_quarantine_target(quarantine: Path, name: str) -> Path:
         n += 1
 
 
+def _is_folder_name(name) -> bool:
+    """Um nome de skill e UM nivel de caminho, nada alem disso.
+
+    O nome chega cru pelo canal JSON (`skills-uninstall` repassa
+    `request["name"]` da janela). `root / name` com "../../Documentos"
+    aponta para fora da base de skills, e a ponte moveria qualquer pasta
+    para a quarentena. Comparar com `Path(name).name` descarta separador,
+    caminho absoluto e unidade (`Path("C:/x").name` e "x").
+    """
+    if not isinstance(name, str):
+        return False
+    return name not in ("", ".", "..") and name == Path(name).name
+
+
 def uninstall(name: str, base_dir: Optional[Path] = None,
               quarantine: Optional[Path] = None, local: bool = False) -> dict:
+    if not _is_folder_name(name):
+        return {"ok": False,
+                "msg": "nome de skill invalido: %s" % str(name)[:60]}
     root = Path(base_dir) if base_dir else skills_base(local)
     folder = root / name
     if not folder.is_dir():
@@ -180,7 +197,13 @@ def uninstall(name: str, base_dir: Optional[Path] = None,
                        "desinstala skill de catalogo" % name}
     destination = _unique_quarantine_target(
         Path(quarantine) if quarantine else quarantine_dir(), name)
-    shutil.move(str(folder), str(destination))
+    try:
+        shutil.move(str(folder), str(destination))
+    except OSError as exc:
+        # Mesma regra do B4 em apply.py: pasta travada e recusa com texto
+        # legivel, nao traceback estourando o canal JSON da janela.
+        return {"ok": False,
+                "msg": "nao consegui mover %s: %s" % (name, exc)}
     return {"ok": True, "quarantine": str(destination),
             "msg": "movida para a quarentena: %s" % destination}
 
@@ -189,6 +212,11 @@ def import_skill(source: Path, base_dir: Optional[Path] = None,
                  local: bool = False,
                  quarantine: Optional[Path] = None) -> dict:
     src = Path(source)
+    if not src.name:
+        # Raiz de unidade/disco nao tem nome: o alvo seria a PROPRIA base e
+        # o copytree derramaria o conteudo dela dentro dela mesma.
+        return {"ok": False,
+                "msg": "a pasta indicada nao tem nome de skill: %s" % src}
     if not src.is_dir() or not (src / "SKILL.md").exists():
         return {"ok": False,
                 "msg": "a pasta indicada nao tem SKILL.md: %s" % src}
@@ -206,14 +234,22 @@ def import_skill(source: Path, base_dir: Optional[Path] = None,
                 "msg": "%s ja e a pasta instalada: nao ha o que importar "
                        "sobre ela" % src}
     replaced = ""
-    if target.exists():
-        # A13: a copia antiga e do usuario e pode ter trabalho dentro -- vai
-        # para a quarentena (mesma regra do uninstall) antes da nova entrar.
-        aside = _unique_quarantine_target(
-            Path(quarantine) if quarantine else quarantine_dir(), src.name)
-        shutil.move(str(target), str(aside))
-        replaced = str(aside)
-    shutil.copytree(str(src), str(target))
+    try:
+        if target.exists():
+            # A13: a copia antiga e do usuario e pode ter trabalho dentro --
+            # vai para a quarentena (mesma regra do uninstall) antes da
+            # nova entrar.
+            aside = _unique_quarantine_target(
+                Path(quarantine) if quarantine else quarantine_dir(),
+                src.name)
+            shutil.move(str(target), str(aside))
+            replaced = str(aside)
+        shutil.copytree(str(src), str(target))
+    except OSError as exc:
+        msg = "nao consegui importar %s: %s" % (src.name, exc)
+        if replaced:
+            msg += " (a copia anterior continua em %s)" % replaced
+        return {"ok": False, "msg": msg}
     msg = "importada para %s" % target
     if replaced:
         msg += " (a copia anterior ficou em %s)" % replaced

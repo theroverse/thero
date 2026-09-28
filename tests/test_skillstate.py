@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -85,6 +86,39 @@ def test_uninstall_of_the_unknown_says_so(base, tmp_path):
     assert out["ok"] is False
 
 
+def test_uninstall_refuses_a_name_that_leaves_the_base(base, tmp_path):
+    # O nome vem da janela pelo canal JSON ("skills-uninstall" repassa
+    # request["name"] cru). Sem a guarda, root / "../../Documents" aponta
+    # para fora da base de skills e a ponte moveria qualquer pasta para a
+    # quarentena. Mesma classe da validacao de ids dos provedores (I4).
+    q = tmp_path / "q"
+    escape = base.parent / "fora-da-base"
+    escape.mkdir()
+    (escape / "SKILL.md").write_text("---\nname: fora\n---\n",
+                                     encoding="utf-8")
+    for bad in ("../fora-da-base", "..\\fora-da-base", "", ".", "..",
+                str(escape), "a/b", 5, None):
+        out = skillstate.uninstall(bad, base_dir=base, quarantine=q)
+        assert out["ok"] is False, bad
+        assert (escape / "SKILL.md").exists()
+    assert not q.exists()
+
+
+def test_uninstall_turns_a_move_failure_into_a_refusal(base, tmp_path,
+                                                      monkeypatch):
+    # Mesma regra do B4 em apply.py: uma pasta travada (PermissionError)
+    # vira recusa com msg legivel, nao um traceback na janela.
+    def boom(src, dst):
+        raise PermissionError(5, "acesso negado")
+
+    monkeypatch.setattr(skillstate.shutil, "move", boom)
+    out = skillstate.uninstall("meu-proprio", base_dir=base,
+                               quarantine=tmp_path / "q")
+    assert out["ok"] is False
+    assert "meu-proprio" in out["msg"]
+    assert (base / "meu-proprio" / "SKILL.md").exists()
+
+
 def test_import_requires_a_skill_md(tmp_path, base):
     junk = tmp_path / "junk"
     junk.mkdir()
@@ -153,6 +187,70 @@ def test_import_refuses_the_folder_that_is_already_installed(tmp_path,
     assert not q.exists()
 
 
+def test_import_refuses_a_root_that_has_no_folder_name(tmp_path, base):
+    # Path("C:\\").name e "" -> o alvo seria a PROPRIA base, e o copytree
+    # tentaria derramar o disco inteiro dentro dela. Checa antes de tocar
+    # em qualquer arquivo, entao a raiz nunca precisa ter SKILL.md.
+    anchor = Path(Path.cwd().anchor)
+    out = skillstate.import_skill(anchor, base_dir=base,
+                                  quarantine=tmp_path / "q")
+    assert out["ok"] is False
+    assert "nome" in out["msg"]      # recusa pelo alvo, nao pelo SKILL.md
+    assert sorted(p.name for p in base.iterdir()) == [
+        "engineering-manager", "meu-proprio", "minha-skill", "sem-skill-md",
+        "supabase"]
+
+
+def test_import_turns_a_copy_failure_into_a_refusal(tmp_path, base,
+                                                   monkeypatch):
+    # B4 tambem vale aqui: se o copytree estoura (pasta travada, disco
+    # cheio), a janela recebe recusa legivel e a base nao ganha alvo pela
+    # metade.
+    calls = []
+
+    def boom(src, dst, **kw):
+        calls.append((src, dst))
+        raise OSError(28, "sem espaco")
+
+    monkeypatch.setattr(skillstate.shutil, "copytree", boom)
+    src = tmp_path / "incompleta"
+    src.mkdir()
+    (src / "SKILL.md").write_text("---\nname: incompleta\n---\n",
+                                  encoding="utf-8")
+    out = skillstate.import_skill(src, base_dir=base)
+    assert out["ok"] is False
+    assert calls
+    assert not (base / "incompleta").exists()
+    assert "incompleta" in out["msg"]
+
+
+def test_a_failed_copy_still_points_at_the_quarantined_old_copy(tmp_path,
+                                                               base,
+                                                               monkeypatch):
+    # Se o copytree estoura DEPOIS de a copia antiga ter ido para a
+    # quarentena, a base ficou sem a skill: a recusa tem de dizer onde o
+    # trabalho do usuario esta, senao ele procura no escuro.
+    def boom(src, dst, **kw):
+        raise OSError(13, "negado")
+
+    monkeypatch.setattr(skillstate.shutil, "copytree", boom)
+    q = tmp_path / "q"
+    old = base / "criada-por-mim"
+    old.mkdir()
+    (old / "SKILL.md").write_text("---\nname: criada-por-mim\n---\n\nvelha\n",
+                                  encoding="utf-8")
+    src = tmp_path / "criada-por-mim"
+    src.mkdir()
+    (src / "SKILL.md").write_text("---\nname: criada-por-mim\n---\n",
+                                  encoding="utf-8")
+    out = skillstate.import_skill(src, base_dir=base, quarantine=q)
+    assert out["ok"] is False
+    assert "copia anterior" in out["msg"]
+    assert "criada-por-mim" in (q / "criada-por-mim" / "SKILL.md").read_text(
+        encoding="utf-8")
+    assert not (base / "criada-por-mim").exists()
+
+
 def test_search_filters_the_known_catalog_and_labels_the_source(base):
     rows = skillstate.search("postgres", base_dir=base)
     assert rows
@@ -193,3 +291,97 @@ def test_manifest_round_trip_records_origin_but_never_invents_files(tmp_path):
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["minha-skill"] == "user"
     assert path.exists()
+
+
+def test_installed_of_a_base_that_does_not_exist_is_empty(tmp_path):
+    # A janela abre com zero skills e com a base ainda criada pelo
+    # instalador: ler uma pasta que nao existe e lista vazia, nao erro.
+    assert skillstate.installed(base_dir=tmp_path / "nao-criada") == []
+
+
+def test_installed_says_nothing_when_the_skill_md_has_no_description(base):
+    # O doc de `_read_desc` promete a linha "sem descricao", nao um texto
+    # emprestado de outro lugar: sem o campo, o valor e "".
+    folder = base / "sem-descricao"
+    folder.mkdir()
+    (folder / "SKILL.md").write_text("---\nname: sem-descricao\n---\n",
+                                     encoding="utf-8")
+    rows = {r["name"]: r for r in skillstate.installed(base_dir=base)}
+    assert rows["sem-descricao"]["desc"] == ""
+
+
+def test_installed_reads_a_cp1252_skill_md_without_inventing_text(base):
+    # O doc de `_read_skill_md` diz: utf-8-sig, senao cp1252 (o PowerShell
+    # 5.1 escreve assim), senao vazio -- nunca U+FFFD, que seria texto
+    # inventado na tela. Este arquivo e binario cp1252 invalido em utf-8.
+    folder = base / "travada"
+    folder.mkdir()
+    (folder / "SKILL.md").write_bytes(
+        "---\nname: travada\ndescription: Fun\u00e7\u00e3o interna\n---\n"
+        .encode("cp1252"))
+    rows = {r["name"]: r for r in skillstate.installed(base_dir=base)}
+    assert rows["travada"]["desc"] == "Fun\u00e7\u00e3o interna"
+    assert "\ufffd" not in rows["travada"]["desc"]
+
+
+def test_path_helpers_point_where_the_ui_documents(base, tmp_path,
+                                                   monkeypatch):
+    # installed/uninstall recebem base e quarenta explicitas pela ponte, mas
+    # o padrao (sem argumento) e o que a tela mostra: global em
+    # ~/.claude/skills, local no cwd do projeto, quarenta sob ~/.thero.
+    from thero import settings
+
+    monkeypatch.setattr(skillstate, "THERO_DIR", tmp_path / ".thero")
+    monkeypatch.setattr(skillstate, "SKILLS_BASE_GLOBAL",
+                        tmp_path / "global" / "skills")
+    assert skillstate.skills_base() == tmp_path / "global" / "skills"
+    assert skillstate.skills_base(True) == Path.cwd() / ".claude" / "skills"
+    quarenta = tmp_path / ".thero" / "quarantine"
+    assert skillstate.quarantine_dir() == (
+        quarenta / settings.SKILLS_QUARANTINE_DIRNAME)
+
+
+def test_installed_gives_up_quietly_when_the_skill_md_cannot_be_read(base):
+    # SKILL.md pode existir como DIRETORIO (instalador interrompido). Ler
+    # falha com OSError: a linha sai sem descricao, e a skill continua na
+    # lista -- a tela nao some com o que nao consegue descrever.
+    folder = base / "quebrada"
+    (folder / "SKILL.md").mkdir(parents=True)
+    rows = {r["name"]: r for r in skillstate.installed(base_dir=base)}
+    assert rows["quebrada"]["desc"] == ""
+
+
+def test_installed_leaves_the_description_empty_when_no_codec_fits(base):
+    # Nem utf-8 nem cp1252: 0x81 nao existe nas duas. O doc promete vazio,
+    # nao caractere de reposicao -- texto inventado na tela.
+    folder = base / "ilegivel"
+    folder.mkdir()
+    (folder / "SKILL.md").write_bytes(b"---\n\xff\x81---\n")
+    rows = {r["name"]: r for r in skillstate.installed(base_dir=base)}
+    assert rows["ilegivel"]["desc"] == ""
+
+
+def test_a_third_removal_in_the_same_second_keeps_its_own_folder(base,
+                                                                tmp_path,
+                                                                monkeypatch):
+    # O laco de sufixo so existe porque shutil.move ENCAIXA a pasta dentro
+    # da outra quando o destino ja existe: tres remocoes no mesmo timestamp
+    # tem de virar tres pastas, cada uma com o seu conteudo.
+    from thero.system import process as system_process
+
+    monkeypatch.setattr(system_process, "timestamp", lambda: "TSFIXO")
+    q = tmp_path / "q"
+    for body in ("primeira", "segunda", "terceira"):
+        # A primeira volta reaproveita a pasta do fixture; depois dela a
+        # pasta nao existe mais e e recriada.
+        folder = base / "meu-proprio"
+        folder.mkdir(exist_ok=True)
+        (folder / "SKILL.md").write_text(body, encoding="utf-8")
+        assert skillstate.uninstall("meu-proprio", base_dir=base,
+                                    quarantine=q)["ok"] is True
+    names = sorted(p.name for p in q.iterdir())
+    assert names == ["meu-proprio", "meu-proprio__TSFIXO",
+                     "meu-proprio__TSFIXO_2"]
+    kept = sorted((q / n / "SKILL.md").read_text(encoding="utf-8")
+                  for n in names)
+    assert kept == ["primeira", "segunda", "terceira"]

@@ -49,6 +49,42 @@
 
 ---
 
+## Decisões do dono (2026-09-28, terceira rodada) — onde cada uma foi prescrita
+
+Quatro respostas dele chegaram **depois** de a Task 6 estar cometada (`095086e`,
+416 passed). Nada delas é código escrito na árvore: cada uma virou **bloco
+prescritivo dentro da task que o executor já vai reescrever**, para não nascer
+por cima das costuras que a auditoria marcou como quebradas.
+
+| # | Decisão (palavra dele) | Onde está prescrita | O que o executor encontra |
+|---|---|---|---|
+| 1 | `ollama pull`/baixas longas "do jeito que funcionar melhor" + cancelar de verdade | **Task 8 Step 4C** (worker) + **Task 9 Step 2B** (host) + **Task 10 Step 6B** | worker por `id`, resposta `accepted` imediata, recusa de baixa dupla com mensagem humana, `models-pull-cancel`, e o aviso de honestidade sobre o que "matar o filho" quer dizer num `POST /api/pull` |
+| 2 | "quero um progress visual na interface (no terminal nao precisa)" | **Task 8 Step 4B** (parse) + **Task 10 Step 6B** (barra) | `("progress", {...})` no `localmodels.pull`, linha do protocolo enriquecida com `pct/completed/total`, e a **barra que já existe** (`#rbar`/`#rpct`/`#rstep`) pintando MB + velocidade; `run` de terminal não muda nada |
+| 3 | "precisamos apenas checar o status e iniciar ou mesmo reiniciar caso necessario (o ollama)" | **Task 8 Step 4D** + **Task 10 Step 6C** + **Task 11 Step 1B/Step 3** | `checar` = o `models-status` passivo que já existe; `engine-start`/`engine-restart` novos, com gatilho explícito, contrato de retorno, processo desanexado e a dependência declarada do plano de instalação |
+| 4 | local de configurações "semelhante ao git config" + teto por tipo de modelo | **Task 6b** (inteira: chave + CLI) + **Task 8 Step 4E** (`limits-get`/`limits-set`) + **Task 10 Step 6D** (tela) | `limits` em `~/.thero/config.json` com defaults `local 4 / standard 3 / premium 2`, `--config limits.local=4` / `--config --get limits.local` / `--config --list`, e a ponte **lendo o disco, nunca o cache** |
+
+**Regras duras que atravessam as quatro** (valem como continuação das
+inegociáveis acima; um executor que contrarie qualquer uma delas para):
+
+- **Nenhum thread pool no `serve()`.** Worker só no caminho de baixa. `run`,
+  `skills-install`, `skills-check`/`skills-update` continuam bloqueando o
+  pedido e sendo cancelados pelo `engine-cancel` do host, que mata a árvore
+  (`taskkill /T`) — lá existe filho de verdade para matar.
+- **Uma barra só.** Por isso o motor recusa o segundo `models-pull` em vez de
+  somar progresso.
+- **Não somos o serviço que hospeda o motor.** O `ollama` que a ponte levanta é
+  **desanexado** (não morre com a janela, não morre com o `--serve`) e ninguém
+  mantém ele vivo: sem watcher, sem retry em background, sem auto-start no
+  arranque da janela, sem binário no payload. Reiniciar só por clique.
+- **Instalar/de-download do Ollama pertence a
+  `docs/superpowers/plans/2026-09-28-instalacao-do-engine-local.md`** (outro
+  trabalho — ver "Fora deste plano", fim do arquivo). Este plano só **lê** a
+  máquina para dizer se existe alguma coisa a iniciar.
+- **Tetos vivem numa chave só, escrita por um `set_dotted` fechado.** A CLI
+  escreve **somente** `limits.*`; nada de `--config` tocar `providers.*` — é
+  onde mora qualquer coisa parecida com credencial, e a regra inegociável 4
+  continua valendo nos dois caminhos.
+
 ## Task 0 — Preparar o terreno (branch + o que já existe)
 
 Verificado nesta máquina em 2026-09-22: o submódulo `thero` está em `develop`
@@ -3511,10 +3547,27 @@ Fatos que mandam aqui:
 - **A14** — consequência da A13: "importar" a própria pasta já instalada (origem == alvo)
   moveria a skill inteira para a quarentena e depois quebraria ao copiar o que sumiu.
   Entra antes disso uma recusa limpa por caminho resolvido, com teste.
+- **A15 (Important, pós-revisão)** — `uninstall(name)` montava `root / name` com o nome
+  cru que vem da janela pelo canal JSON (o `skills-uninstall` de `_handle_skills`, na
+  Task 8, repassa `request["name"]` sem olhar). `name = "../../Documentos"` escapava da
+  base de skills e a ponte movia qualquer pasta da máquina para a quarentena. Mesma
+  classe da I4 dos provedores (validar id). Entra `_is_folder_name()`: tem de ser `str`,
+  um único nível de caminho (`name == Path(name).name`), e não `""`/`.`/`..`. Teste com
+  sete entradas hostis, inclusive `str(escape)` (caminho absoluto) e tipos errados.
+- **A16 (Minor, pós-revisão)** — `shutil.move`/`copytree` subiam crus: uma pasta travada
+  (`PermissionError`) virava traceback no `except Exception` da ponte, com mensagem
+  técnica na janela — o B4 de `apply.py` já firmou que falha de escrita é **recusa com
+  msg legível**. Os dois pontos de movimento agora devolvem `{"ok": False, "msg": ...}`, e
+  a recusa da importação diz onde ficou a cópia anterior se a quarentena já ocorreu.
+- **A17 (pós-revisão)** — o código prescrito tinha 6 comportamentos afirmados em comentário
+  e sem teste (fallback cp1252 do `SKILL.md`, `SKILL.md` ilegível, descrição ausente, base
+  inexistente, `skills_base`/`quarantine_dir` padrão, terceira remoção no mesmo segundo).
+  Todos cobertos: **100% das statements** de `skillstate.py`, mesma régua da Task 4.
 - **Baseline** — a cadeia `337 + 13 = 350` era aritmética de duas rodadas atrás. Baseline
-  medido hoje: **400 passed** (fim da Task 5 revisada). Esta seção prescreve **16**
-  `def test_` → `400 + 16 = 416`. As cadeias das Tasks 7+ continuam com bases antigas e
-  cada executor deve recalculá-las contra o baseline real, como foi feito na Task 5.
+  medido hoje: **400 passed** (fim da Task 5 revisada). Esta seção prescrevia **16**
+  `def test_`; com A15-A17 passou a **28** → `400 + 28 = 428`. As cadeias das Tasks 7+
+  continuam com bases antigas e cada executor deve recalculá-las contra o baseline real,
+  como foi feito na Task 5.
 
 - [ ] **Step 1: Testes**
 
@@ -3522,6 +3575,7 @@ Fatos que mandam aqui:
 
 ```python
 import json
+from pathlib import Path
 
 import pytest
 
@@ -3608,6 +3662,39 @@ def test_uninstall_of_the_unknown_says_so(base, tmp_path):
     assert out["ok"] is False
 
 
+def test_uninstall_refuses_a_name_that_leaves_the_base(base, tmp_path):
+    # O nome vem da janela pelo canal JSON ("skills-uninstall" repassa
+    # request["name"] cru). Sem a guarda, root / "../../Documents" aponta
+    # para fora da base de skills e a ponte moveria qualquer pasta para a
+    # quarentena. Mesma classe da validacao de ids dos provedores (I4).
+    q = tmp_path / "q"
+    escape = base.parent / "fora-da-base"
+    escape.mkdir()
+    (escape / "SKILL.md").write_text("---\nname: fora\n---\n",
+                                     encoding="utf-8")
+    for bad in ("../fora-da-base", "..\\fora-da-base", "", ".", "..",
+                str(escape), "a/b", 5, None):
+        out = skillstate.uninstall(bad, base_dir=base, quarantine=q)
+        assert out["ok"] is False, bad
+        assert (escape / "SKILL.md").exists()
+    assert not q.exists()
+
+
+def test_uninstall_turns_a_move_failure_into_a_refusal(base, tmp_path,
+                                                      monkeypatch):
+    # Mesma regra do B4 em apply.py: uma pasta travada (PermissionError)
+    # vira recusa com msg legivel, nao um traceback na janela.
+    def boom(src, dst):
+        raise PermissionError(5, "acesso negado")
+
+    monkeypatch.setattr(skillstate.shutil, "move", boom)
+    out = skillstate.uninstall("meu-proprio", base_dir=base,
+                               quarantine=tmp_path / "q")
+    assert out["ok"] is False
+    assert "meu-proprio" in out["msg"]
+    assert (base / "meu-proprio" / "SKILL.md").exists()
+
+
 def test_import_requires_a_skill_md(tmp_path, base):
     junk = tmp_path / "junk"
     junk.mkdir()
@@ -3676,6 +3763,70 @@ def test_import_refuses_the_folder_that_is_already_installed(tmp_path,
     assert not q.exists()
 
 
+def test_import_refuses_a_root_that_has_no_folder_name(tmp_path, base):
+    # Path("C:\\").name e "" -> o alvo seria a PROPRIA base, e o copytree
+    # tentaria derramar o disco inteiro dentro dela. Checa antes de tocar
+    # em qualquer arquivo, entao a raiz nunca precisa ter SKILL.md.
+    anchor = Path(Path.cwd().anchor)
+    out = skillstate.import_skill(anchor, base_dir=base,
+                                  quarantine=tmp_path / "q")
+    assert out["ok"] is False
+    assert "nome" in out["msg"]      # recusa pelo alvo, nao pelo SKILL.md
+    assert sorted(p.name for p in base.iterdir()) == [
+        "engineering-manager", "meu-proprio", "minha-skill", "sem-skill-md",
+        "supabase"]
+
+
+def test_import_turns_a_copy_failure_into_a_refusal(tmp_path, base,
+                                                   monkeypatch):
+    # B4 tambem vale aqui: se o copytree estoura (pasta travada, disco
+    # cheio), a janela recebe recusa legivel e a base nao ganha alvo pela
+    # metade.
+    calls = []
+
+    def boom(src, dst, **kw):
+        calls.append((src, dst))
+        raise OSError(28, "sem espaco")
+
+    monkeypatch.setattr(skillstate.shutil, "copytree", boom)
+    src = tmp_path / "incompleta"
+    src.mkdir()
+    (src / "SKILL.md").write_text("---\nname: incompleta\n---\n",
+                                  encoding="utf-8")
+    out = skillstate.import_skill(src, base_dir=base)
+    assert out["ok"] is False
+    assert calls
+    assert not (base / "incompleta").exists()
+    assert "incompleta" in out["msg"]
+
+
+def test_a_failed_copy_still_points_at_the_quarantined_old_copy(tmp_path,
+                                                               base,
+                                                               monkeypatch):
+    # Se o copytree estoura DEPOIS de a copia antiga ter ido para a
+    # quarentena, a base ficou sem a skill: a recusa tem de dizer onde o
+    # trabalho do usuario esta, senao ele procura no escuro.
+    def boom(src, dst, **kw):
+        raise OSError(13, "negado")
+
+    monkeypatch.setattr(skillstate.shutil, "copytree", boom)
+    q = tmp_path / "q"
+    old = base / "criada-por-mim"
+    old.mkdir()
+    (old / "SKILL.md").write_text("---\nname: criada-por-mim\n---\n\nvelha\n",
+                                  encoding="utf-8")
+    src = tmp_path / "criada-por-mim"
+    src.mkdir()
+    (src / "SKILL.md").write_text("---\nname: criada-por-mim\n---\n",
+                                  encoding="utf-8")
+    out = skillstate.import_skill(src, base_dir=base, quarantine=q)
+    assert out["ok"] is False
+    assert "copia anterior" in out["msg"]
+    assert "criada-por-mim" in (q / "criada-por-mim" / "SKILL.md").read_text(
+        encoding="utf-8")
+    assert not (base / "criada-por-mim").exists()
+
+
 def test_search_filters_the_known_catalog_and_labels_the_source(base):
     rows = skillstate.search("postgres", base_dir=base)
     assert rows
@@ -3716,6 +3867,100 @@ def test_manifest_round_trip_records_origin_but_never_invents_files(tmp_path):
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["minha-skill"] == "user"
     assert path.exists()
+
+
+def test_installed_of_a_base_that_does_not_exist_is_empty(tmp_path):
+    # A janela abre com zero skills e com a base ainda criada pelo
+    # instalador: ler uma pasta que nao existe e lista vazia, nao erro.
+    assert skillstate.installed(base_dir=tmp_path / "nao-criada") == []
+
+
+def test_installed_says_nothing_when_the_skill_md_has_no_description(base):
+    # O doc de `_read_desc` promete a linha "sem descricao", nao um texto
+    # emprestado de outro lugar: sem o campo, o valor e "".
+    folder = base / "sem-descricao"
+    folder.mkdir()
+    (folder / "SKILL.md").write_text("---\nname: sem-descricao\n---\n",
+                                     encoding="utf-8")
+    rows = {r["name"]: r for r in skillstate.installed(base_dir=base)}
+    assert rows["sem-descricao"]["desc"] == ""
+
+
+def test_installed_reads_a_cp1252_skill_md_without_inventing_text(base):
+    # O doc de `_read_skill_md` diz: utf-8-sig, senao cp1252 (o PowerShell
+    # 5.1 escreve assim), senao vazio -- nunca U+FFFD, que seria texto
+    # inventado na tela. Este arquivo e binario cp1252 invalido em utf-8.
+    folder = base / "travada"
+    folder.mkdir()
+    (folder / "SKILL.md").write_bytes(
+        "---\nname: travada\ndescription: Fun\u00e7\u00e3o interna\n---\n"
+        .encode("cp1252"))
+    rows = {r["name"]: r for r in skillstate.installed(base_dir=base)}
+    assert rows["travada"]["desc"] == "Fun\u00e7\u00e3o interna"
+    assert "\ufffd" not in rows["travada"]["desc"]
+
+
+def test_path_helpers_point_where_the_ui_documents(base, tmp_path,
+                                                   monkeypatch):
+    # installed/uninstall recebem base e quarenta explicitas pela ponte, mas
+    # o padrao (sem argumento) e o que a tela mostra: global em
+    # ~/.claude/skills, local no cwd do projeto, quarenta sob ~/.thero.
+    from thero import settings
+
+    monkeypatch.setattr(skillstate, "THERO_DIR", tmp_path / ".thero")
+    monkeypatch.setattr(skillstate, "SKILLS_BASE_GLOBAL",
+                        tmp_path / "global" / "skills")
+    assert skillstate.skills_base() == tmp_path / "global" / "skills"
+    assert skillstate.skills_base(True) == Path.cwd() / ".claude" / "skills"
+    quarenta = tmp_path / ".thero" / "quarantine"
+    assert skillstate.quarantine_dir() == (
+        quarenta / settings.SKILLS_QUARANTINE_DIRNAME)
+
+
+def test_installed_gives_up_quietly_when_the_skill_md_cannot_be_read(base):
+    # SKILL.md pode existir como DIRETORIO (instalador interrompido). Ler
+    # falha com OSError: a linha sai sem descricao, e a skill continua na
+    # lista -- a tela nao some com o que nao consegue descrever.
+    folder = base / "quebrada"
+    (folder / "SKILL.md").mkdir(parents=True)
+    rows = {r["name"]: r for r in skillstate.installed(base_dir=base)}
+    assert rows["quebrada"]["desc"] == ""
+
+
+def test_installed_leaves_the_description_empty_when_no_codec_fits(base):
+    # Nem utf-8 nem cp1252: 0x81 nao existe nas duas. O doc promete vazio,
+    # nao caractere de reposicao -- texto inventado na tela.
+    folder = base / "ilegivel"
+    folder.mkdir()
+    (folder / "SKILL.md").write_bytes(b"---\n\xff\x81---\n")
+    rows = {r["name"]: r for r in skillstate.installed(base_dir=base)}
+    assert rows["ilegivel"]["desc"] == ""
+
+
+def test_a_third_removal_in_the_same_second_keeps_its_own_folder(base,
+                                                                tmp_path,
+                                                                monkeypatch):
+    # O laco de sufixo so existe porque shutil.move ENCAIXA a pasta dentro
+    # da outra quando o destino ja existe: tres remocoes no mesmo timestamp
+    # tem de virar tres pastas, cada uma com o seu conteudo.
+    from thero.system import process as system_process
+
+    monkeypatch.setattr(system_process, "timestamp", lambda: "TSFIXO")
+    q = tmp_path / "q"
+    for body in ("primeira", "segunda", "terceira"):
+        # A primeira volta reaproveita a pasta do fixture; depois dela a
+        # pasta nao existe mais e e recriada.
+        folder = base / "meu-proprio"
+        folder.mkdir(exist_ok=True)
+        (folder / "SKILL.md").write_text(body, encoding="utf-8")
+        assert skillstate.uninstall("meu-proprio", base_dir=base,
+                                    quarantine=q)["ok"] is True
+    names = sorted(p.name for p in q.iterdir())
+    assert names == ["meu-proprio", "meu-proprio__TSFIXO",
+                     "meu-proprio__TSFIXO_2"]
+    kept = sorted((q / n / "SKILL.md").read_text(encoding="utf-8")
+                  for n in names)
+    assert kept == ["primeira", "segunda", "terceira"]
 ```
 
 - [ ] **Step 2: Rodar para confirmar falha**
@@ -3898,8 +4143,25 @@ def _unique_quarantine_target(quarantine: Path, name: str) -> Path:
         n += 1
 
 
+def _is_folder_name(name) -> bool:
+    """Um nome de skill e UM nivel de caminho, nada alem disso.
+
+    O nome chega cru pelo canal JSON (`skills-uninstall` repassa
+    `request["name"]` da janela). `root / name` com "../../Documentos"
+    aponta para fora da base de skills, e a ponte moveria qualquer pasta
+    para a quarentena. Comparar com `Path(name).name` descarta separador,
+    caminho absoluto e unidade (`Path("C:/x").name` e "x").
+    """
+    if not isinstance(name, str):
+        return False
+    return name not in ("", ".", "..") and name == Path(name).name
+
+
 def uninstall(name: str, base_dir: Optional[Path] = None,
               quarantine: Optional[Path] = None, local: bool = False) -> dict:
+    if not _is_folder_name(name):
+        return {"ok": False,
+                "msg": "nome de skill invalido: %s" % str(name)[:60]}
     root = Path(base_dir) if base_dir else skills_base(local)
     folder = root / name
     if not folder.is_dir():
@@ -3912,7 +4174,13 @@ def uninstall(name: str, base_dir: Optional[Path] = None,
                        "desinstala skill de catalogo" % name}
     destination = _unique_quarantine_target(
         Path(quarantine) if quarantine else quarantine_dir(), name)
-    shutil.move(str(folder), str(destination))
+    try:
+        shutil.move(str(folder), str(destination))
+    except OSError as exc:
+        # Mesma regra do B4 em apply.py: pasta travada e recusa com texto
+        # legivel, nao traceback estourando o canal JSON da janela.
+        return {"ok": False,
+                "msg": "nao consegui mover %s: %s" % (name, exc)}
     return {"ok": True, "quarantine": str(destination),
             "msg": "movida para a quarentena: %s" % destination}
 
@@ -3921,6 +4189,11 @@ def import_skill(source: Path, base_dir: Optional[Path] = None,
                  local: bool = False,
                  quarantine: Optional[Path] = None) -> dict:
     src = Path(source)
+    if not src.name:
+        # Raiz de unidade/disco nao tem nome: o alvo seria a PROPRIA base e
+        # o copytree derramaria o conteudo dela dentro dela mesma.
+        return {"ok": False,
+                "msg": "a pasta indicada nao tem nome de skill: %s" % src}
     if not src.is_dir() or not (src / "SKILL.md").exists():
         return {"ok": False,
                 "msg": "a pasta indicada nao tem SKILL.md: %s" % src}
@@ -3938,14 +4211,22 @@ def import_skill(source: Path, base_dir: Optional[Path] = None,
                 "msg": "%s ja e a pasta instalada: nao ha o que importar "
                        "sobre ela" % src}
     replaced = ""
-    if target.exists():
-        # A13: a copia antiga e do usuario e pode ter trabalho dentro -- vai
-        # para a quarentena (mesma regra do uninstall) antes da nova entrar.
-        aside = _unique_quarantine_target(
-            Path(quarantine) if quarantine else quarantine_dir(), src.name)
-        shutil.move(str(target), str(aside))
-        replaced = str(aside)
-    shutil.copytree(str(src), str(target))
+    try:
+        if target.exists():
+            # A13: a copia antiga e do usuario e pode ter trabalho dentro --
+            # vai para a quarentena (mesma regra do uninstall) antes da
+            # nova entrar.
+            aside = _unique_quarantine_target(
+                Path(quarantine) if quarantine else quarantine_dir(),
+                src.name)
+            shutil.move(str(target), str(aside))
+            replaced = str(aside)
+        shutil.copytree(str(src), str(target))
+    except OSError as exc:
+        msg = "nao consegui importar %s: %s" % (src.name, exc)
+        if replaced:
+            msg += " (a copia anterior continua em %s)" % replaced
+        return {"ok": False, "msg": msg}
     msg = "importada para %s" % target
     if replaced:
         msg += " (a copia anterior ficou em %s)" % replaced
@@ -3977,7 +4258,7 @@ def save_manifest(manifest: dict, path: Optional[Path] = None) -> Path:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `400 + 16 = 416 passed` — o baseline de 400 e o medido no fim da Task 5
+Expected: `400 + 28 = 428 passed` — o baseline de 400 e o medido no fim da Task 5
 revisada (fora daqui, as cadeias das Tasks 7+ ainda tem bases antigas e precisam
 ser recalculadas por quem as executa).
 
