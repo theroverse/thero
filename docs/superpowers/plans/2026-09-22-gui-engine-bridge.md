@@ -62,7 +62,7 @@ por cima das costuras que a auditoria marcou como quebradas.
 > Task 7** (`tests/test_process_stream.py` com **8** `def test_`, não os 6
 > prescritos) e `0287c92` somou o LM Studio. `python -m pytest tests/ -q` hoje =
 > **442 passed**. Todas as contagens abaixo estão reliquadas contra esse número,
-> e a regra de re-meIDA em cada Step "Rodar" é `grep -c "^def test"` + a suíte
+> e a regra de re-medição em cada Step "Rodar" é `grep -c "^def test"` + a suíte
 > inteira, nunca a aritmética desta página.
 
 | # | Decisão (palavra dele) | Onde está prescrita | O que o executor encontra |
@@ -4734,10 +4734,13 @@ Acrescentar ao `HELP_EPILOG_TEMPLATE`, na seção COMANDOS:
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `428 + 15 = 443 passed`. Contagem verificável sem confiar na aritmética:
-`grep -c "^def test" tests/test_config_limits.py` → `15`. A base de 428 é a
-medida no fim da Task 6 revisada (`22ea931` + a retenção de backup da Task 5,
-`5fcc3b7`, rodado nesta sessão: `428 passed in 2.71s`).
+Expected: **`442 + 15 = 457 passed`**. Contagem verificável sem confiar na
+aritmética: `grep -c "^def test" tests/test_config_limits.py` → `15` (nenhum
+parametrizado, então defs = casos). A linha revista dizia `428 + 15 = 443` e
+estava certa na época; a branch andou (Task 7 em `b4bb7ec`, LM Studio em
+`0287c92`) e a base medida agora é **442** (`python -m pytest tests/ -q` → `442
+passed in 3.00s`). Esta task **não foi executada**: `tests/test_config_limits.py`
+não existe.
 
 - [ ] **Step 6: Verificação manual dos três formatos (é o contrato dele)**
 
@@ -4954,7 +4957,11 @@ reatribuição por:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `443 + 6 = 449 passed` (os testes que cobriam `run_command` continuam passando — comportamento externo inalterado; a base 443 é a medida no fim da Task 6b, e este bloco prescreve exatamente 6 `def test_` — conferir com `grep -c "^def test" tests/test_process_stream.py`).
+Expected no papel: `443 + 6 = 449`. **Esta task já foi executada** (`b4bb7ec`,
+`tests/test_process_stream.py` com **8** `def test_` — dois a mais que os 6
+prescritos), então o número vivo é outro: medido hoje `442 passed`. Não re-rodar
+nem re-contar esta task; ela aparece aqui só para a cadeia das seguintes partir
+da base real (442), não da de papel (449).
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -6696,20 +6703,21 @@ grep -c "^def test" tests/test_bridge.py tests/test_localmodels.py tests/test_en
 python -m pytest tests/ -q
 ```
 
-| Arquivo | Antes | Delta prescrito | Depois |
+| Arquivo | Antes (medido hoje) | Delta prescrito | Depois |
 |---|---|---|---|
-| `tests/test_bridge.py` | 30 (Step 1) | −1 (`test_models_pull_streams`) +9 (4C) +4 (4D) +6 (4E) | **48** |
-| `tests/test_localmodels.py` | 20 (medido hoje: `grep -c "^def test"` = 20) | +3 (4B) +2 (4C) | **25** |
-| `tests/test_engineproc.py` | não existe | +5 (4D), arquivo novo | **5** |
-| Suíte inteira | 437 (fim da Task 7) | +48 +5 +5 | **495** |
+| `tests/test_bridge.py` | 0 (não existe) | Step 1: 30 − 1 (`test_models_pull_streams`) + 19 destes passos | **48** defs = 48 casos |
+| `tests/test_localmodels.py` | **23** defs / **32** casos (o plano antigo dizia 29: contava defs de outra rodada) | +3 (4B) +2 (4C) | **28** defs / **37** casos |
+| `tests/test_engineproc.py` | não existe | +5 (4D), arquivo novo | **5** defs = 5 casos |
+| Suíte inteira (casos) | **442** hoje, em `0287c92` | +15 (Task 6b, ainda não executada) + 58 (esta task) | **515** |
 
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `437 + 48 + 5 + 5 = 495 passed` — conferindo os 48/5/5 com o `grep -c`
-da tabela acima; se a auditoria tiver removido testes deste bloco ao corrigir os
-chamadores, a base continua 437 e só os termos seguintes mudam (reportar o número
-final no commit, não reescrever esta linha).
+Expected: **`442 + 15 + 58 = 515 passed`** — conferindo os 48/5/5 com o `grep -c`
+da tabela acima. Se a auditoria de costura remover testes deste bloco ao corrigir
+os chamadores, a base continua 442 e só os termos seguintes mudam: **re-medir
+(`python -m pytest tests/ -q`) antes de escrever o número no commit**, não
+reescrever esta linha para caber na aritmética.
 
 - [ ] **Step 6: Smoke manual do protocolo (sem UI)**
 
@@ -7276,8 +7284,9 @@ assíncrono faltando — sintaxe não é semântica):
 grep -c "parsed.result.accepted\|parsed.pct\|-ne \$reqId" gui/TheroHost.ps1
 ```
 Expected: `3` (um por branch novo; zero = o Step 2B não foi aplicado). **Contagem
-de testes Python desta task: inalterada em 496** — Task 9 não escreve Python; a
-verificação dela é o parser do PowerShell acima.
+de testes Python desta task: inalterada em 515** — Task 9 não escreve Python (e a
+auditoria pode corrigir blocos dela sem acrescentar `def test_`); a verificação
+dela é o parser do PowerShell acima.
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -8571,8 +8580,8 @@ def test_the_bridge_has_exactly_one_thread_and_it_is_the_pull_worker():
 - [ ] **Step 2: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `495 + 13 = 508 passed` (7 do Step 1 + 6 deste passo — conferir com
-`grep -c "^def test" tests/test_gui_static.py` → `13`; a base 495 é a medida no
+Expected: **`515 + 13 = 528 passed`** (7 do Step 1 + 6 deste passo — conferir com
+`grep -c "^def test" tests/test_gui_static.py` → `13`; a base 515 é a esperada no
 fim da Task 8, e as Tasks 9 e 10 não escrevem Python).
 
 - [ ] **Step 3: Smoke manual da janela**
@@ -9043,11 +9052,12 @@ ls -la dist/
 Expected: `dist/Thero.exe` (payload de `src/` + `thero.py` + `gui/` embutido) e
 nenhum `Thero.win32.exe`/`.tmp.ps1` solto na raiz.
 
-Antes do commit, `python -m pytest tests/ -q` → **508 passed**: esta task não
-escreve Python (os itens novos de verificação acima são manuais, marcados no
-PR), então a contagem da cadeia termina aqui, medida em cada task:
-**416** (baseline, Tasks 0-6) → **431** (6b) → **437** (7) → **495** (8) →
-**495** (9, PowerShell) → **495** (10, `app.js`) → **508** (11).
+Antes do commit, `python -m pytest tests/ -q` → **528 passed**: esta task não
+escreve Python (os itens novos de verificação acima são manuais, marcados no PR).
+A cadeia, conferida contra a árvore hoje: **416** (`095086e`, Tasks 0-6) →
+**428** (`22ea931`/`5fcc3b7`, A15-A17 + retenção de backup) → **442** (executadas:
+Task 7 em `b4bb7ec` com 8 defs e o LM Studio em `0287c92`) → **457** (6b, +15,
+pendente) → **515** (8, +58) → 515 (9) → 515 (10) → **528** (11, +13).
 
 - [ ] **Step 6: Testar de fora do repositório (é esse o ponto do portable)**
 
