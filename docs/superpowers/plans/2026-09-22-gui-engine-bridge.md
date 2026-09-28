@@ -3480,9 +3480,38 @@ Fatos que mandam aqui:
 |---|---|
 | Skills vivem em `~/.claude/skills/<nome>/SKILL.md` (base global) ou `./.claude/skills/` (`--local`) | `skills/installer.py:11-33` (`--agent claude-code`, `--global`) |
 | O catálogo do Thero é `SKILL_REPOSITORIES[*]["wanted"]` + o `impeccable`, que tem instalador próprio (`npx impeccable install`) | `skills/catalog.py`, `skills/installer.py:131-191` |
-| **Não existe** marcador de procedência no disco: o que existe é "está na lista do Thero?" | inspeção de `~/.claude/skills/` nesta máquina |
+| **Não existe** marcador de procedência no disco: o que existe é "está na lista do Thero?" | inspeção de `~/.claude/skills/` nesta máquina (40 pastas, nenhum arquivo de lock da ferramenta) |
+| A lista medida hoje tem **33 nomes** e **`caveman` está nela** (`catalog.py:73-79`, repo `JuliusBrussee/caveman`) | execução real de `thero_skill_names()` em 2026-09-28 — `minha-skill` e `nao-existe-no-catalogo` estão ausentes |
 | `npx skills search` **não verificado** (o `npm install` desta máquina está quebrado, então nunca rodei o subcomando) | tentativa real desta sessão |
 | Desinstalar = mover para quarentena, nunca `rmtree` | política do projeto (mesma lógica de limpeza do Vector) |
+
+#### Correções desta rodada (auditoria de costura, 2026-09-28)
+
+- **A10 (Critical)** — o teste antigo exigia `pytest.raises(skillstate.ProtectedSkill)`
+  contra uma implementação que **retorna** `{"ok": False, ...}`: `Failed: DID NOT RAISE`.
+  A classe estava definida e nunca era levantada em lugar nenhum. A ponte da Task 8
+  (`_handle_skills`) já consome o dict e devolve `_err` — levantar exceção ali estouraria
+  o canal JSON. O contrato real é o dict, com a pasta intacta no disco, e a classe morta
+  foi **removida** (nada de exceção declarada sem caminho de levante).
+- **A11 (Critical)** — `caveman` é skill do catálogo do Thero e dois testes + o fixture
+  afirmavam o contrário. Os testes passam a ser escritos contra a lista **medida por
+  execução** (33 nomes, acima): o fixture usa nomes realmente do usuário (`minha-skill`,
+  `meu-proprio`) e a ausência afirmada é de um nome realmente externo
+  (`nao-existe-no-catalogo`). Consequência de produto assumida aqui, e não escondida:
+  uma cópia do usuário que tenha nome de catálogo fica **undesinstalável pela interface**
+  — é a pergunta 1 ao dono; sem marcador de procedência no disco, o conservador é proteger
+  por nome (o plano diz que o manifesto não é fonte de verdade da UI).
+- **A12** — as buscas prescritas chamavam `skillstate.search(...)` **sem** `base_dir`, o que
+  faria todo teste ler a `~/.claude/skills` real da máquina (40 pastas, resultado
+  não-determinístico na flag `installed`). Agora toda busca no teste passa `base_dir=base`.
+- **A13** — `import_skill` sobrescrevia pasta existente com `shutil.rmtree`: o único
+  apagamento do módulo, contrário à política da tabela acima e sem teste. Passa a mover a
+  cópia antiga para a quarentena (parâmetro `quarantine` opcional, mesmo shape do
+  `uninstall`), agora coberto por teste.
+- **Baseline** — a cadeia `337 + 13 = 350` era aritmética de duas rodadas atrás. Baseline
+  medido hoje: **400 passed** (fim da Task 5 revisada). Esta seção prescreve **15**
+  `def test_` → `400 + 15 = 415`. As cadeias das Tasks 7+ continuam com bases antigas e
+  cada executor deve recalculá-las contra o baseline real, como foi feito na Task 5.
 
 - [ ] **Step 1: Testes**
 
@@ -3499,7 +3528,11 @@ from thero import skillstate
 @pytest.fixture
 def base(tmp_path):
     root = tmp_path / "skills"
-    for name in ("engineering-manager", "supabase", "caveman", "meu-proprio"):
+    # "engineering-manager" e "supabase" estao no catalogo (medido); os dois
+    # ultimos NAO estao -- sao a copia propria do usuario. `caveman` nao serve
+    # de exemplo aqui: ela ESTA no catalogo (A11).
+    for name in ("engineering-manager", "supabase", "minha-skill",
+                 "meu-proprio"):
         folder = root / name
         folder.mkdir(parents=True)
         (folder / "SKILL.md").write_text(
@@ -3514,23 +3547,34 @@ def test_thero_names_come_from_the_catalog_plus_impeccable():
     assert "engineering-manager" in names
     assert "supabase-postgres-best-practices" in names
     assert "impeccable" in names
-    assert "caveman" not in names          # repo do usuario, nao "do Thero"
+    # medido em 2026-09-28: catalog.py:73-79 traz o repo JuliusBrussee/caveman,
+    # entao "caveman" E do Thero -- proteger por nome e isso que acontece.
+    assert "caveman" in names
+    assert "minha-skill" not in names
+    assert "nao-existe-no-catalogo" not in names
 
 
 def test_installed_marks_origin_and_skips_folders_without_a_skill_md(base):
     rows = skillstate.installed(base_dir=base)
     by_name = {r["name"]: r for r in rows}
-    assert set(by_name) == {"engineering-manager", "supabase", "caveman",
+    assert set(by_name) == {"engineering-manager", "supabase", "minha-skill",
                             "meu-proprio"}
     assert by_name["engineering-manager"]["origin"] == "thero"
-    assert by_name["caveman"]["origin"] == "user"
+    assert by_name["supabase"]["origin"] == "thero"
+    assert by_name["minha-skill"]["origin"] == "user"
     assert by_name["meu-proprio"]["origin"] == "user"
 
 
 def test_uninstall_refuses_a_skill_the_thero_installed(base, tmp_path):
-    with pytest.raises(skillstate.ProtectedSkill):
-        skillstate.uninstall("supabase", base_dir=base,
-                             quarantine=tmp_path / "q")
+    # A ponte (Task 8: `out = skillstate.uninstall(...)`, `if not out["ok"]`)
+    # consome DICT e serializa no canal JSON: levantar excecao aqui quebraria
+    # a ponte. Contrato real = {"ok": False} e a pasta continua no disco.
+    q = tmp_path / "q"
+    out = skillstate.uninstall("supabase", base_dir=base, quarantine=q)
+    assert out["ok"] is False
+    assert "Thero" in out["msg"]
+    assert (base / "supabase" / "SKILL.md").exists()
+    assert not q.exists()           # recusou antes de mover qualquer coisa
 
 
 def test_uninstall_moves_to_quarantine_instead_of_deleting(base, tmp_path):
@@ -3570,39 +3614,74 @@ def test_import_requires_a_skill_md(tmp_path, base):
 
 
 def test_import_copies_the_folder_and_marks_it_user(tmp_path, base):
-    src = tmp_path / "minha-skill"
+    # nome proprio do teste (A13): nao colide com o fixture, senao a
+    # importacao empurraria a pasta do fixture para a quarentena.
+    src = tmp_path / "criada-por-mim"
     src.mkdir()
     (src / "SKILL.md").write_text(
-        "---\nname: minha-skill\ndescription: x\n---\n", encoding="utf-8")
+        "---\nname: criada-por-mim\ndescription: x\n---\n", encoding="utf-8")
     (src / "reference.md").write_text("apoio", encoding="utf-8")
     out = skillstate.import_skill(src, base_dir=base)
     assert out["ok"] is True
-    target = base / "minha-skill"
+    target = base / "criada-por-mim"
     assert (target / "SKILL.md").exists()
     assert (target / "reference.md").exists()
     rows = {r["name"]: r for r in skillstate.installed(base_dir=base)}
-    assert rows["minha-skill"]["origin"] == "user"
+    assert rows["criada-por-mim"]["origin"] == "user"
 
 
 def test_import_refuses_to_overwrite_a_thero_skill(tmp_path, base):
     src = tmp_path / "supabase"
     src.mkdir()
-    (src / "SKILL.md").write_text("---\nname: supabase\n---\n", encoding="utf-8")
+    (src / "SKILL.md").write_text("---\nname: supabase\n---\n",
+                                  encoding="utf-8")
     out = skillstate.import_skill(src, base_dir=base)
     assert out["ok"] is False
     assert "Thero" in out["msg"]
 
 
-def test_search_filters_the_known_catalog_and_labels_the_source():
-    rows = skillstate.search("postgres")
+def test_import_over_a_user_folder_quarantines_the_old_copy(tmp_path, base):
+    # A13: reimportar NUNCA e um rmtree na copia antiga do usuario.
+    q = tmp_path / "q"
+    old = base / "criada-por-mim"
+    old.mkdir()
+    (old / "SKILL.md").write_text(
+        "---\nname: criada-por-mim\n---\n\nrascunho antigo\n",
+        encoding="utf-8")
+    src = tmp_path / "criada-por-mim"
+    src.mkdir()
+    (src / "SKILL.md").write_text(
+        "---\nname: criada-por-mim\ndescription: nova\n---\n",
+        encoding="utf-8")
+    out = skillstate.import_skill(src, base_dir=base, quarantine=q)
+    assert out["ok"] is True
+    assert "antigo" in (q / "criada-por-mim" / "SKILL.md").read_text(
+        encoding="utf-8")
+    assert "nova" in (base / "criada-por-mim" / "SKILL.md").read_text(
+        encoding="utf-8")
+
+
+def test_search_filters_the_known_catalog_and_labels_the_source(base):
+    rows = skillstate.search("postgres", base_dir=base)
     assert rows
     assert all(r["source"] == "catalogo do thero" for r in rows)
     assert all("repo" in r and "skill" in r for r in rows)
-    assert skillstate.search("zznadaaver") == []
+    assert skillstate.search("zznadaaver", base_dir=base) == []
 
 
-def test_search_documents_that_the_community_cli_is_unverified():
-    rows = skillstate.search("")
+def test_search_flags_what_is_already_installed(base):
+    # A Task 10 mostra o catalogo INTEIRO e marca o que ja esta la; se a
+    # flag sumir, a tela esconde as skills nao instaladas.
+    rows = {r["skill"]: r for r in skillstate.search("supabase",
+                                                     base_dir=base)}
+    assert rows["supabase"]["installed"] is True
+    assert rows["supabase-postgres-best-practices"]["installed"] is False
+    assert all("installed" in r for r in skillstate.search("",
+                                                           base_dir=base))
+
+
+def test_search_documents_that_the_community_cli_is_unverified(base):
+    rows = skillstate.search("", base_dir=base)
     assert any(r.get("unverified") for r in rows) or "npx" in skillstate.NOTE
 
 
@@ -3617,9 +3696,11 @@ def test_skill_line_command_matches_the_installer_builder():
 
 def test_manifest_round_trip_records_origin_but_never_invents_files(tmp_path):
     path = tmp_path / "manifest.json"
-    skillstate.save_manifest({"supabase": "thero", "caveman": "user"}, path)
+    skillstate.save_manifest({"supabase": "thero", "minha-skill": "user"},
+                             path)
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["caveman"] == "user"
+    assert data["minha-skill"] == "user"
+    assert path.exists()
 ```
 
 - [ ] **Step 2: Rodar para confirmar falha**
@@ -3634,16 +3715,21 @@ Create `src/thero/skillstate.py`:
 ```python
 """O que a tela de Skills precisa saber: quem instalou o que, e para onde vai.
 
-Procedencia: NAO existe marcador no disco (fatos da secao de contexto deste
-plano). A origem real e "esta pasta esta na lista do catalogo do Thero?".
-Por isso `thero_skill_names()` vem do proprio catalogo, nao de um registro
-paralelo que poderia descer do passo.
+Procedencia: NAO existe marcador no disco (ver a tabela de fatos). A origem
+real e "esta pasta esta na lista do catalogo do Thero?", por isso
+`thero_skill_names()` vem do proprio catalogo, nao de um registro paralelo
+que poderia descer do passo. Consequencia assumida: uma copia propria do
+usuario com nome de catalogo (ex.: "caveman", que ESTA em catalog.py) e
+classificada como "thero" e nao sai pela interface -- pergunte 1 ao dono.
+O manifesto abaixo e anotacao opcional do usuario, nao fonte de verdade.
 
 Busca: o `npx skills search` nunca foi verificado nesta maquina (o npm local
 esta quebrado), entao NAO invento subcomando. `search()` filtra o catalogo
-conhecido e marca o que e comunitario como nao verificado.
+conhecido e `NOTE` declara o que nao foi verificado.
 
-Remocao: move para quarentena. Nada e apagado.
+Remocao e reimportacao: movem para a quarentena, nunca apagam (mesma politica
+do backup de `apply.py`: tocar um arquivo sem saber o que tem dentro e
+proibido). Nada aqui imprime: o stdout da ponte e o canal JSON.
 """
 
 from __future__ import annotations
@@ -3670,10 +3756,6 @@ NOTE = (
 )
 
 
-class ProtectedSkill(Exception):
-    """Skill do Thero: a interface nao desinstala."""
-
-
 def quarantine_dir() -> Path:
     return THERO_DIR / "quarantine" / SKILLS_QUARANTINE_DIRNAME
 
@@ -3691,14 +3773,28 @@ def thero_skill_names() -> set:
     return names
 
 
-def _read_title(folder: Path) -> str:
-    """Primeiro `description:` do SKILL.md, sem parser de YAML completo."""
+def _read_skill_md(folder: Path) -> str:
+    """Texto do SKILL.md para EXIBIR, sem `errors="replace"`.
+
+    utf-8-sig tolera BOM; cai para cp1252 (o que o PowerShell 5.1 escreve)
+    so quando o utf-8 falha. Falhou nas duas -> vazio, e a linha sai sem
+    descricao: nao finjo que li o que nao cabe em nenhuma codificacao.
+    """
     try:
-        lines = (folder / "SKILL.md").read_text(
-            encoding="utf-8-sig", errors="replace").splitlines()
+        return (folder / "SKILL.md").read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        pass
     except OSError:
         return ""
-    for line in lines[:24]:
+    try:
+        return (folder / "SKILL.md").read_text(encoding="cp1252")
+    except (UnicodeDecodeError, OSError):
+        return ""
+
+
+def _read_desc(folder: Path) -> str:
+    """Primeiro `description:` do SKILL.md, sem parser de YAML completo."""
+    for line in _read_skill_md(folder).splitlines()[:24]:
         stripped = line.strip()
         if stripped.lower().startswith("description:"):
             return stripped.split(":", 1)[1].strip().strip("\"'")[:160]
@@ -3720,7 +3816,7 @@ def installed(base_dir: Optional[Path] = None,
             "name": name,
             "path": str(folder),
             "origin": "thero" if name in owned else "user",
-            "desc": _read_title(folder),
+            "desc": _read_desc(folder),
             "base": str(root),
         })
     return rows
@@ -3757,6 +3853,8 @@ def search(query: str = "", base_dir: Optional[Path] = None,
         if needle and needle not in haystack.lower():
             continue
         row = dict(row)
+        # A Task 10 mostra o catalogo inteiro e marca o que ja esta na base:
+        # sem esta flag a tela esconderia o que ainda nao foi instalado.
         row["installed"] = row["skill"] in have
         out.append(row)
     return out
@@ -3775,7 +3873,8 @@ def _unique_quarantine_target(quarantine: Path, name: str) -> Path:
     suffix = timestamp()
     n = 1
     while True:
-        candidate = quarantine / ("%s__%s" % (name, suffix if n == 1 else "%s_%d" % (suffix, n)))
+        tag = suffix if n == 1 else "%s_%d" % (suffix, n)
+        candidate = quarantine / ("%s__%s" % (name, tag))
         if not candidate.exists():
             return candidate
         n += 1
@@ -3788,9 +3887,11 @@ def uninstall(name: str, base_dir: Optional[Path] = None,
     if not folder.is_dir():
         return {"ok": False, "msg": "nao encontrei %s em %s" % (name, root)}
     if name in thero_skill_names():
+        # DICT, nao excecao: a ponte da Task 8 le out["ok"] e devolve _err
+        # no mesmo canal JSON. "esta na lista" e o que sabemos (A11).
         return {"ok": False,
-                "msg": "%s foi instalada pelo Thero e nao pode ser "
-                       "desinstalada pela interface" % name}
+                "msg": "%s esta na lista do Thero: a interface nao "
+                       "desinstala skill de catalogo" % name}
     destination = _unique_quarantine_target(
         Path(quarantine) if quarantine else quarantine_dir(), name)
     shutil.move(str(folder), str(destination))
@@ -3799,7 +3900,8 @@ def uninstall(name: str, base_dir: Optional[Path] = None,
 
 
 def import_skill(source: Path, base_dir: Optional[Path] = None,
-                 local: bool = False) -> dict:
+                 local: bool = False,
+                 quarantine: Optional[Path] = None) -> dict:
     src = Path(source)
     if not src.is_dir() or not (src / "SKILL.md").exists():
         return {"ok": False,
@@ -3811,11 +3913,19 @@ def import_skill(source: Path, base_dir: Optional[Path] = None,
     root = Path(base_dir) if base_dir else skills_base(local)
     root.mkdir(parents=True, exist_ok=True)
     target = root / src.name
+    replaced = ""
     if target.exists():
-        shutil.rmtree(str(target))
+        # A13: a copia antiga e do usuario e pode ter trabalho dentro -- vai
+        # para a quarentena em vez de rmtree, e so depois disso a nova entra.
+        aside = _unique_quarantine_target(
+            Path(quarantine) if quarantine else quarantine_dir(), src.name)
+        shutil.move(str(target), str(aside))
+        replaced = str(aside)
     shutil.copytree(str(src), str(target))
-    return {"ok": True, "path": str(target), "origin": "user",
-            "msg": "importada para %s" % target}
+    msg = "importada para %s" % target
+    if replaced:
+        msg += " (a copia anterior ficou em %s)" % replaced
+    return {"ok": True, "path": str(target), "origin": "user", "msg": msg}
 
 
 def install_command(repo: str, skill: str,
@@ -3827,7 +3937,9 @@ def save_manifest(manifest: dict, path: Optional[Path] = None) -> Path:
     """Registro opcional de procedencia propria do usuario.
 
     Nao e fonte de verdade da UI (a fonte e o catalogo) -- existe so para o
-    usuario anotar o que ele mesmo instalou, se quiser.
+    usuario anotar o que ele mesmo instalou, se quiser. Nenhuma funcao deste
+    modulo o le: sem um formato firmado com a janela, inventar a leitura agora
+    seria mecanismo novo (pergunte 1 ao dono).
     """
     target = Path(path) if path else THERO_DIR / "skill-manifest.json"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -3841,7 +3953,9 @@ def save_manifest(manifest: dict, path: Optional[Path] = None) -> Path:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `337 + 13 = 350 passed`
+Expected: `400 + 15 = 415 passed` — o baseline de 400 e o medido no fim da Task 5
+revisada (fora daqui, as cadeias das Tasks 7+ ainda tem bases antigas e precisam
+ser recalculadas por quem as executa).
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
