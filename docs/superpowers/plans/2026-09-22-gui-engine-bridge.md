@@ -177,7 +177,7 @@ def test_load_missing_file_returns_defaults(tmp_path):
 def test_load_corrupt_file_returns_defaults_instead_of_crashing(tmp_path):
     p = tmp_path / "config.json"
     p.write_text("{ isto nao e json", encoding="utf-8")
-    assert config.load(p)["version"] == config.CONFIG_VERSION
+    assert config.load(p) == config.default_config()
 
 
 def test_save_then_load_roundtrip_keeps_accents(tmp_path):
@@ -188,12 +188,22 @@ def test_save_then_load_roundtrip_keeps_accents(tmp_path):
     assert config.load(p)["providers"][0]["label"] == "Ômega — local"
 
 
-def test_save_writes_no_bom(tmp_path):
-    # memoria: config JSON com BOM quebra json.loads estrito no Windows
+def test_save_creates_the_directory_when_absent(tmp_path):
+    # a primeira gravacao na maquina do usuario e exatamente esse caso:
+    # ~/.thero ainda nao existe
+    p = tmp_path / ".thero" / "config.json"
+    config.save(config.default_config(), path=p)
+    assert p.exists()
+
+
+def test_save_writes_no_bom_and_leaves_no_temp_file(tmp_path):
+    # memoria: config JSON com BOM quebra json.loads estrito no Windows.
+    # a gravacao e atomica (tmp + os.replace), entao nao pode sobrar sobra.
     p = tmp_path / "config.json"
     config.save(config.default_config(), path=p)
     assert not p.read_bytes().startswith(b"\xef\xbb\xbf")
     json.loads(p.read_text(encoding="utf-8"))  # nao pode lancar erro
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_load_tolerates_a_bom_on_disk(tmp_path):
@@ -240,10 +250,6 @@ Acrescentar ao fim de `src/thero/settings.py` (mantendo o que já existe):
 # aceita `path=`/`base=` explicito -- os testes injetam tmp_path, ja que o
 # conftest faz monkeypatch do HOME DEPOIS do import.
 THERO_DIR = Path.home() / ".thero"
-
-CONFIG_FILENAME = "config.json"
-
-CONFIG_PATH = THERO_DIR / CONFIG_FILENAME
 
 # Skills vivem no territorio do Claude Code (mesma base do instalador);
 # a quarentena das removidas fica na pasta do Thero.
@@ -523,9 +529,12 @@ Create `src/thero/config.py`:
 """Store de `~/.thero/config.json`: o que o usuario parametrizou na interface.
 
 Regras que ja custaram tempo nesta maquina: ler com `utf-8-sig` (Set-Content
-do PowerShell escreve BOM e o `json.loads` estrito morre), escrever SEM BOM, e
-nunca perder escolha do usuario ao evoluir o schema -- merge chave a chave
-sobre os defaults, chave desconhecida preservada.
+do PowerShell escreve BOM e o `json.loads` estrito morre), escrever SEM BOM e
+escrever atomico (arquivo meio gravado + o fallback de corrompido viram
+perda de escolha), e nao perder escolha do usuario ao evoluir o schema -- as
+chaves de topo sao sobrepostas aos defaults, chave desconhecida preservada.
+Campos novos DENTRO de uma entrada de `providers`/`agents` nao sao injetados:
+quem consome essas listas le com `.get()` e default proprio.
 """
 
 from __future__ import annotations
@@ -581,10 +590,13 @@ def save(cfg: dict, path: Optional[Path] = None) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(cfg)
     payload["version"] = CONFIG_VERSION
-    target.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    # Escrita atomica: `load()` devolve os defaults para arquivo corrompido,
+    # entao uma gravacao interrompida no meio custaria as escolhas do usuario
+    # na proxima abertura. os.replace() e atomico no Windows e no POSIX, 3.9+.
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(str(tmp), str(target))
     return target
 
 
@@ -595,7 +607,7 @@ def is_first_run(path: Optional[Path] = None) -> bool:
 - [ ] **Step 6: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `247 + 13 = 260 passed` (nada dos testes antigos pode quebrar)
+Expected: `247 + 14 = 261 passed` (nada dos testes antigos pode quebrar)
 
 - [ ] **Step 7: Commit (pedir confirmação antes)**
 
@@ -916,7 +928,7 @@ def snapshot(
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `260 + 8 = 268 passed`
+Expected: `261 + 8 = 269 passed`
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -1244,7 +1256,7 @@ def status(base: str = "") -> dict:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `268 + 8 = 276 passed`
+Expected: `269 + 8 = 277 passed`
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -1594,7 +1606,7 @@ def blank_from_preset(pid: str, label: str = "") -> dict:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `276 + 13 = 289 passed`
+Expected: `277 + 13 = 290 passed`
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -2194,7 +2206,7 @@ def apply_all(cfg: dict, paths: dict,
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `289 + 18 = 307 passed` (os testes antigos do comando global cobrem o `upsert_marked_block` delegado e continuam passando)
+Expected: `290 + 18 = 308 passed` (os testes antigos do comando global cobrem o `upsert_marked_block` delegado e continuam passando)
 
 - [ ] **Step 6: Commit (pedir confirmação)**
 
@@ -2578,7 +2590,7 @@ def save_manifest(manifest: dict, path: Optional[Path] = None) -> Path:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `307 + 13 = 320 passed`
+Expected: `308 + 13 = 321 passed`
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -2779,7 +2791,7 @@ reatribuição por:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `320 + 6 = 326 passed` (os testes que cobriam `run_command` continuam passando — comportamento externo inalterado)
+Expected: `321 + 6 = 327 passed` (os testes que cobriam `run_command` continuam passando — comportamento externo inalterado)
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -2813,7 +2825,7 @@ import json
 
 import pytest
 
-from thero import __version__, bridge, presets
+from thero import __version__, bridge, config, presets
 
 
 @pytest.fixture
@@ -2922,7 +2934,7 @@ def test_config_command_returns_the_seeded_defaults(state):
 
 
 def test_config_set_persists_and_reloads(state):
-    cfg = presets.default_config()
+    cfg = config.default_config()
     cfg["providers"][0]["model"] = "opus"
     out = call(state, {"id": 9, "cmd": "config-set", "config": cfg})
     assert out["ok"] is True
@@ -2937,7 +2949,7 @@ def test_config_set_refuses_a_non_dict(state):
 
 def test_provider_register_never_echoes_a_key_value(state, monkeypatch):
     monkeypatch.setenv("THERO_OPENAI_API_KEY", "sk-SEGREDO")
-    cfg = presets.default_config()
+    cfg = config.default_config()
     state.cfg = cfg
     pid = "openai"
     out = call(state, {"id": 12, "cmd": "providers-register", "id": pid})
@@ -2953,7 +2965,7 @@ def test_provider_presets_are_served_for_the_add_dialog(state):
 
 
 def test_provider_upsert_and_remove_flow(state):
-    cfg = presets.default_config()
+    cfg = config.default_config()
     call(state, {"id": 14, "cmd": "config-set", "config": cfg})
     new = {"id": "meu", "label": "Meu provedor", "preset": "custom",
            "authKind": "apikey", "authVar": "THERO_MEU_API_KEY", "base": "",
@@ -2990,7 +3002,7 @@ def test_agents_apply_all_reports_every_enabled_agent(state):
 
 
 def test_record_only_agent_reports_no_write(state):
-    cfg = presets.default_config()
+    cfg = config.default_config()
     cfg["agents"].append({"id": "qoder", "label": "Qoder", "preset": "qoder",
                           "target": "none", "provider": "openai",
                           "model": "gpt-4o", "enabled": True,
@@ -3303,7 +3315,7 @@ def _handle_config(state: BridgeState, request: dict):
         return _ok(request["id"], {"config": merged,
                                    "path": str(state.config_path)})
     if cmd == "config-reset":
-        state.persist(presets.default_config())
+        state.persist(config_store.default_config())
         return _ok(request["id"], {"config": state.load()})
     return None
 
@@ -3666,7 +3678,7 @@ Acrescentar ao `HELP_EPILOG_TEMPLATE`, na seção COMANDOS:
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `326 + 30 = 356 passed`
+Expected: `327 + 30 = 357 passed`
 
 - [ ] **Step 6: Smoke manual do protocolo (sem UI)**
 
@@ -5120,7 +5132,7 @@ def test_the_bridge_command_list_matches_the_ui_vocabulary():
 - [ ] **Step 2: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `356 + 7 = 363 passed`
+Expected: `357 + 7 = 364 passed`
 
 - [ ] **Step 3: Smoke manual da janela**
 
