@@ -228,6 +228,16 @@ def register(provider: dict) -> dict:
                    "a cada chamada" % var}
 
 
+def redact(value: object) -> str:
+    """Versao publica da redacao de credencial (A3, Task 5).
+
+    apply.py precisa redigir a mesma base antes de devolver um motivo de
+    recusa de loopback; expor daqui evita copiar a regex para outro modulo
+    (duas fontes divergiriam e uma delas vazaria a credencial).
+    """
+    return _redact(value)
+
+
 def _redact(base: str) -> str:
     """Corta o userinfo (ate o "@" do "://user:pass@host") antes do echo.
 

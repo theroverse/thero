@@ -6,6 +6,36 @@ from pathlib import Path
 from thero.settings import COMMAND_MARKER_END, COMMAND_MARKER_START
 
 
+def upsert_block(
+    existing: str,
+    block: str,
+    start: str,
+    end: str,
+) -> str:
+    """
+    Troca (ou acrescenta) `block` dentro de `existing`, reconhecendo pelos
+    marcadores `start`/`end`. O bloco ja traz os proprios marcadores (como o
+    template do comando global): a funcao DETECTA e substitui, nunca injeta --
+    injetar duplicaria os marcadores no arquivo. Idempotente: rodar duas
+    vezes nao duplica, e o texto depois do marcador final continua la.
+    """
+    block = block.strip("\n") + "\n"
+
+    if start in existing and end in existing:
+        start_index = existing.index(start)
+        end_index = existing.index(end) + len(end)
+        return (
+            existing[:start_index]
+            + block
+            + existing[end_index:].lstrip("\n")
+        )
+
+    if existing.strip():
+        return existing.rstrip("\n") + "\n\n" + block
+
+    return block
+
+
 def upsert_marked_block(
     existing: str,
     block: str,
@@ -16,29 +46,11 @@ def upsert_marked_block(
     marcadores em vez de duplicar.
     """
 
-    block = block.strip("\n") + "\n"
-
-    if (
-        COMMAND_MARKER_START in existing
-        and COMMAND_MARKER_END in existing
-    ):
-        start_index = existing.index(COMMAND_MARKER_START)
-        end_index = existing.index(
-            COMMAND_MARKER_END
-        ) + len(COMMAND_MARKER_END)
-
-        return (
-            existing[:start_index]
-            + block
-            + existing[end_index:].lstrip("\n")
-        )
-
-    separator = "\n\n" if existing.strip() else ""
-
-    return (
-        existing.rstrip("\n") + separator + block
-        if existing.strip()
-        else block
+    return upsert_block(
+        existing,
+        block,
+        COMMAND_MARKER_START,
+        COMMAND_MARKER_END,
     )
 
 
