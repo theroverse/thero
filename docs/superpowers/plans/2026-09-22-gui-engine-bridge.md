@@ -2518,6 +2518,14 @@ Arquivo real = fonte da verdade.**
 - **Produto — backup e aviso na tela.** Todo retorno traz `"backup"` (nome do
   arquivo criado, ou `""` quando não houve) e o `msg` menciona o que foi
   tocado. O backup fica na máquina, nunca é versionado nem enviado.
+  **Retenção decidida pelo dono em 2026-09-28:** no máximo **dois** arquivos
+  por alvo, e não uma série temporal — `<stem>-original.zbkp<ext>` grava o
+  primeiro byte que existiu e **nunca** é sobrescrito, `<stem>-last.zbkp<ext>`
+  guarda o conteúdo imediatamente anterior e é substituído a cada escrita
+  (ex.: `settings-original.zbkp.md` / `settings-last.zbkp.md`, no formato que
+  ele escreveu). O campo `backup` devolve o nome do `-last`; o do original é
+  determinístico, então não há informação perdida. A mesma regra vale para o
+  `.gitignore` do `.zeus/` no plano do Zeus.
 
 **Correções da pós-revisão da Task 5 (B1-B5), já costuradas nos blocos acima.**
 
@@ -2532,6 +2540,10 @@ Arquivo real = fonte da verdade.**
   segundo; duas escritas no mesmo alvo no mesmo segundo faziam o 2º backup
   sobrescrever o 1º. Nome em colisao ganha sufixo `_2`, `_3`, ... até livre;
   backup existente nunca é apagado nem sobrescrito (sem expurgo inventado).
+  **SUBSTITUÍDO em 2026-09-28** pela retenção de dois arquivos (bullet
+  "Produto" acima): com nomes fixos `-original`/`-last` não existe colisão
+  possível, então o laço de sufixo e o `timestamp()` saíram de `_backup`.
+  Quem reler este item não deve reimplantar o sufixo numerado.
 - **B3 — `end` órfão antes do bloco.** Em `upsert_block`, o `end` é procurado
   a partir do `start` (`find(end, start_index)`) e o `start` do bloco
   gerenciado é o par mais próximo desse `end` (`rindex(start, 0, end_index)`):
@@ -2679,10 +2691,14 @@ def test_apply_claude_backs_up_before_touching(tmp_path, cfg):
     target = tmp_path / "settings.json"
     target.write_text(json.dumps({"env": {"X": "1"}}), encoding="utf-8")
     apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
-    backups = list(tmp_path.glob("settings.backup_*"))
-    assert len(backups) == 1
-    saved = json.loads(backups[0].read_text(encoding="utf-8"))
-    assert saved["env"]["X"] == "1"
+    # Duas copias do mesmo byte pre-gravado: a primeira escrita ainda nao tem
+    # historico, entao o original e o ultimo sao o conteudo que existia.
+    names = sorted(p.name for p in tmp_path.glob("*.zbkp.*"))
+    assert names == ["settings-last.zbkp.json",
+                     "settings-original.zbkp.json"]
+    for name in names:
+        saved = json.loads((tmp_path / name).read_text(encoding="utf-8"))
+        assert saved["env"]["X"] == "1"
 
 
 def test_apply_refuses_an_unparseable_file_and_leaves_it_alone(tmp_path, cfg):
@@ -2692,7 +2708,7 @@ def test_apply_refuses_an_unparseable_file_and_leaves_it_alone(tmp_path, cfg):
     assert out["ok"] is False
     assert "nao fui" in out["msg"].lower() or "parse" in out["msg"].lower()
     assert target.read_text(encoding="utf-8") == "{ isto nao e json"
-    assert list(tmp_path.glob("settings.backup_*")) == []
+    assert list(tmp_path.glob("*.zbkp.*")) == []
     assert out["backup"] == ""
 
 
@@ -2858,7 +2874,7 @@ def test_apply_profile_refuses_remote_base_and_writes_nothing(tmp_path, cfg):
     assert out["ok"] is False
     assert "loopback" in out["msg"].lower()
     assert profile.read_text(encoding="utf-8") == "function foo {}\n"
-    assert list(tmp_path.glob("profile.backup_*")) == []
+    assert list(tmp_path.glob("*.zbkp.*")) == []
     assert "secret" not in out["msg"]
     assert "user" not in out["msg"]
 
@@ -2884,7 +2900,7 @@ def test_apply_refuses_an_undecodable_file_and_writes_nothing(tmp_path, cfg):
     out = apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
     assert out["ok"] is False
     assert target.read_bytes() == junk
-    assert list(tmp_path.glob("settings.backup_*")) == []
+    assert list(tmp_path.glob("*.zbkp.*")) == []
     assert out["backup"] == ""
 
 
@@ -2901,7 +2917,7 @@ def test_apply_refuses_unencodable_content_without_truncating(tmp_path, cfg):
     out = apply.apply_claude(agent, cfg, target)
     assert out["ok"] is False
     assert target.read_bytes() == original
-    assert list(tmp_path.glob("settings.backup_*")) == []
+    assert list(tmp_path.glob("*.zbkp.*")) == []
     assert out["backup"] == ""
     assert "codificacao" in out["msg"].lower()
 
@@ -2965,7 +2981,7 @@ def test_apply_returns_the_backup_name_when_overwriting(tmp_path, cfg):
     target = tmp_path / "settings.json"
     target.write_text("{}", encoding="utf-8")
     out = apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
-    assert out["backup"].startswith("settings.backup_")
+    assert out["backup"] == "settings-last.zbkp.json"
     assert out["backup"] in out["msg"]     # msg menciona o que foi tocado
 
 
@@ -2979,7 +2995,7 @@ def test_apply_refuses_when_the_os_blocks_the_write(tmp_path, cfg):
     out = apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
     assert out["ok"] is False
     assert "settings.json" in out["msg"]
-    assert list(tmp_path.glob("settings.backup_*")) == []
+    assert list(tmp_path.glob("*.zbkp.*")) == []
     assert target.is_dir()
 
 
@@ -2990,25 +3006,29 @@ def test_apply_backup_is_empty_when_no_prior_file(tmp_path, cfg):
     assert "settings.json" in out["msg"]
 
 
-def test_backup_names_do_not_collide_in_the_same_second(tmp_path, cfg,
-                                                        monkeypatch):
-    # B2: timestamp() tem resolucao de 1 segundo; duas escritas no mesmo alvo
-    # dentro do mesmo segundo faziam o 2o backup sobrescrever o 1o e o
-    # conteudo original mais antigo se perdia. Nome em colisao ganha sufixo
-    # _2, _3... (nada e apagado nem sobrescrito). Controle explicito do
-    # timestamp, sem sleep.
-    monkeypatch.setattr(apply, "timestamp", lambda: "20260928_120000")
+def test_two_writes_keep_exactly_the_original_and_the_last(tmp_path, cfg):
+    # Decisao do dono em 2026-09-28: no maximo DOIS arquivos por alvo, e nao
+    # uma serie temporal. O "-original" guarda o primeiro byte que existiu e
+    # NUNCA e sobrescrito; o "-last" guarda o conteudo imediatamente anterior
+    # a escrita atual. Sem timestamp no nome: duas escritas no mesmo segundo
+    # (o caso que o B2 resolvia com sufixo _2) agora simplesmente atualizam
+    # o mesmo par, porque nao ha mais o que colidir.
     target = tmp_path / "settings.json"
-    original = json.dumps({"env": {"X": "1"}})
-    target.write_text(original, encoding="utf-8")
+    target.write_text(json.dumps({"env": {"X": "1"}}), encoding="utf-8")
     agent = apply.find_agent(cfg, "claude")
     apply.apply_claude(agent, cfg, target)
-    after_first = target.read_text(encoding="utf-8")
-    apply.apply_claude(agent, cfg, target)
-    backups = sorted(tmp_path.glob("settings.backup_*"))
-    assert len(backups) == 2
-    assert backups[0].read_text(encoding="utf-8") == original
-    assert backups[1].read_text(encoding="utf-8") == after_first
+    # Outra mao mexe no arquivo entre as duas escritas do Thero: o "-last"
+    # tem de apontar para o conteudo anterior a esta escrita, nao para o 1o.
+    target.write_text(json.dumps({"env": {"X": "2"}}), encoding="utf-8")
+    out = apply.apply_claude(agent, cfg, target)
+    assert out["ok"] is True
+    assert sorted(p.name for p in tmp_path.glob("*.zbkp.*")) == [
+        "settings-last.zbkp.json", "settings-original.zbkp.json"]
+    original = (tmp_path / "settings-original.zbkp.json").read_text(
+        encoding="utf-8")
+    assert json.loads(original)["env"]["X"] == "1"
+    last = (tmp_path / "settings-last.zbkp.json").read_text(encoding="utf-8")
+    assert json.loads(last)["env"]["X"] == "2"
 ```
 
 - [ ] **Step 2: Rodar para confirmar falha**
@@ -3117,7 +3137,6 @@ from thero.settings import (
     ENV_MARKER_START,
     OLLAMA_DEFAULT_HOST,
 )
-from thero.system.process import timestamp
 
 
 def default_paths(home: Optional[Path] = None) -> dict:
@@ -3139,24 +3158,29 @@ def find_agent(cfg: dict, agent_id: str) -> Optional[dict]:
 
 
 def _backup(path: Path) -> str:
-    """Copia silenciosa ANTES de tocar; devolve o NOME do backup (ou "").
+    """Copia silenciosa ANTES de tocar; devolve o NOME do ultimo backup.
 
     system.backup.backup_file() faz print() -- otimo no terminal, e o canal da
     ponte e JSON. Aqui o backup e efeito colateral, nao mensagem. Fica na
-    maquina: nunca e versionado nem enviado. timestamp() tem resolugao de
-    1 segundo (B2): nome em colisao ganha sufixo _2, _3... ate liberar --
-    backup existente nunca e apagado nem sobrescrito.
+    maquina: nunca e versionado nem enviado.
+
+    Retencao decidida pelo dono em 2026-09-28: no maximo DOIS arquivos por
+    alvo, sem serie temporal. "-original" e escrito uma vez e nunca e
+    sobrescrito: e o byte que existia antes da primeira mexida do Thero.
+    "-last" e substituido a cada escrita e guarda o conteudo imediatamente
+    anterior. Nome fixo, sem timestamp -- o caso que o B2 resolvia com sufixo
+    _2 nao existe mais, porque duas escritas no mesmo segundo atualizam o
+    mesmo par.
     """
     if not path.exists():
         return ""
-    stem = "%s.backup_%s" % (path.stem, timestamp())
-    target = path.with_name(stem + path.suffix)
-    serial = 2
-    while target.exists():
-        target = path.with_name("%s_%d%s" % (stem, serial, path.suffix))
-        serial += 1
-    shutil.copy2(str(path), str(target))
-    return target.name
+    original = path.with_name("%s-original.zbkp%s" % (path.stem,
+                                                      path.suffix))
+    if not original.exists():
+        shutil.copy2(str(path), str(original))
+    last = path.with_name("%s-last.zbkp%s" % (path.stem, path.suffix))
+    shutil.copy2(str(path), str(last))
+    return last.name
 
 
 def _backup_note(backup: str) -> str:

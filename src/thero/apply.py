@@ -31,7 +31,6 @@ from thero.settings import (
     ENV_MARKER_START,
     OLLAMA_DEFAULT_HOST,
 )
-from thero.system.process import timestamp
 
 
 def default_paths(home: Optional[Path] = None) -> dict:
@@ -53,24 +52,29 @@ def find_agent(cfg: dict, agent_id: str) -> Optional[dict]:
 
 
 def _backup(path: Path) -> str:
-    """Copia silenciosa ANTES de tocar; devolve o NOME do backup (ou "").
+    """Copia silenciosa ANTES de tocar; devolve o NOME do ultimo backup.
 
     system.backup.backup_file() faz print() -- otimo no terminal, e o canal da
     ponte e JSON. Aqui o backup e efeito colateral, nao mensagem. Fica na
-    maquina: nunca e versionado nem enviado. timestamp() tem resolugao de
-    1 segundo (B2): nome em colisao ganha sufixo _2, _3... ate liberar --
-    backup existente nunca e apagado nem sobrescrito.
+    maquina: nunca e versionado nem enviado.
+
+    Retencao decidida pelo dono em 2026-09-28: no maximo DOIS arquivos por
+    alvo, sem serie temporal. "-original" e escrito uma vez e nunca e
+    sobrescrito: e o byte que existia antes da primeira mexida do Thero.
+    "-last" e substituido a cada escrita e guarda o conteudo imediatamente
+    anterior. Nome fixo, sem timestamp -- o caso que o B2 resolvia com sufixo
+    _2 nao existe mais, porque duas escritas no mesmo segundo atualizam o
+    mesmo par.
     """
     if not path.exists():
         return ""
-    stem = "%s.backup_%s" % (path.stem, timestamp())
-    target = path.with_name(stem + path.suffix)
-    serial = 2
-    while target.exists():
-        target = path.with_name("%s_%d%s" % (stem, serial, path.suffix))
-        serial += 1
-    shutil.copy2(str(path), str(target))
-    return target.name
+    original = path.with_name("%s-original.zbkp%s" % (path.stem,
+                                                      path.suffix))
+    if not original.exists():
+        shutil.copy2(str(path), str(original))
+    last = path.with_name("%s-last.zbkp%s" % (path.stem, path.suffix))
+    shutil.copy2(str(path), str(last))
+    return last.name
 
 
 def _backup_note(backup: str) -> str:
