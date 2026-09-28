@@ -1401,6 +1401,11 @@ def list_models(base: str = "") -> dict:
             payload = json.loads(response.read().decode("utf-8", "replace"))
     except (urllib.error.URLError, ValueError, OSError) as exc:
         return {"ok": False, "models": [], "error": _describe(exc)}
+    if not isinstance(payload, dict):
+        # JSON valido, mas nao o objeto esperado: a tela degrada com erro
+        # humano, nunca com AttributeError no meio do payload da ponte.
+        return {"ok": False, "models": [],
+                "error": "resposta inesperada do Ollama (/api/tags)"}
     models = []
     for item in payload.get("models", []):
         size = int(item.get("size") or 0)
@@ -1454,6 +1459,11 @@ def pull(name: str, base: str = "") -> Iterator[tuple]:
         try:
             event = json.loads(line)
         except ValueError:
+            yield ("out", line)
+            continue
+        if not isinstance(event, dict):
+            # JSON atomico solto na stream ("123", "ok"): vira saida crua,
+            # nao AttributeError que escaparia pela geradora.
             yield ("out", line)
             continue
         text = event.get("status") or event.get("error") or line
@@ -1511,6 +1521,18 @@ git commit -m "feat(models): loopback-only Ollama client for the local models sc
 **Files:**
 - Create: `src/thero/providers.py`
 - Test: `tests/test_providers.py`
+
+**Correções já aplicadas neste plano (revisão estática antes da implementação):**
+1. `remove()` ganhou o veto de **modelo roteado** — sem ele, apagar um provedor
+   cujo modelo ainda está em `routing.athena`/`routing.sentinel` deixaria
+   `ATHENA_OLLAMA_MODEL`/`SENTINEL_OLLAMA_MODEL` (Task 5) com valor pendurado.
+2. O teste de `providers-register` do tipo `local` foi alinhado ao contrato da
+   Task 3: `list_models` envia `Request`, não string.
+3. `register(..., runner=...)` removido — nenhum chamador passava, a ponte
+   (Task 8) chama `providers.register(provider)`.
+4. `summary()` cai no `kind` do preset quando a entrada não traz o campo.
+5. `_probe_loopback` virou uma sonda só (o veto de loopback já vive dentro de
+   `localmodels.list_models`), eliminando o pedido HTTP duplo por registro.
 
 - [ ] **Step 1: Testes**
 
@@ -1580,23 +1602,25 @@ def test_remove_refuses_a_provider_a_routing_slot_still_models_on():
     # `models-set` grava routing[slot] = NOME DO MODELO, e a Task 5 escreve esse
     # nome em ATHENA_OLLAMA_MODEL / SENTINEL_OLLAMA_MODEL. Apagar o provedor que
     # fornece aquele modelo deixaria a variavel de ambiente com valor pendurado.
+    # So se testa provedor `origin: user` -- os do Thero ja estao protegidos
+    # antes, por outro excecao.
     cfg = json.loads(json.dumps(CFG))
     cfg["providers"].append({"id": "meu", "label": "Meu", "origin": "user",
                              "roles": {}, "model": "gpt-3.5-turbo",
                              "models": ["gpt-3.5-turbo"]})
+    cfg["providers"].append({"id": "local2", "label": "Local 2",
+                             "origin": "user", "roles": {},
+                             "model": "llama3.2", "models": ["llama3.2"]})
+    # routing.athena = llama3.2 (do CFG), e e do local2:
+    with pytest.raises(providers.ProviderInUse):
+        providers.remove(cfg, "local2")
+    # routing.sentinel = llama3.2 tambem; re-roteado, o local2 fica livre:
     cfg["routing"]["athena"] = "gpt-3.5-turbo"
+    cfg["routing"]["sentinel"] = "gpt-3.5-turbo"
     with pytest.raises(providers.ProviderInUse):
         providers.remove(cfg, "meu")
-    # o slot sentinela ainda esta no llama3.2, que e do provedor ollama:
-    with pytest.raises(providers.ProviderInUse):
-        providers.remove(cfg, "ollama")
-    # o provedo ollama ainda e dono do llama3.2 roteado; o "meu" ainda e dono
-    # do gpt-3.5-turbo roteado. Os dois continuam protegidos:
-    cfg["routing"]["sentinel"] = "outro-modelo"
-    with pytest.raises(providers.ProviderInUse):
-        providers.remove(cfg, "meu")
-    with pytest.raises(providers.ProviderInUse):
-        providers.remove(cfg, "ollama")
+    out = providers.remove(cfg, "local2")
+    assert "local2" not in [p["id"] for p in out["providers"]]
 
 
 def test_register_session_kind_confirms_without_touching_the_network():
@@ -1694,7 +1718,7 @@ devolver em mensagem, log ou erro -- no maximo informa se a variavel existe.
 from __future__ import annotations
 
 import os
-from typing import Callable, Optional
+from typing import Optional
 
 from thero import localmodels, presets
 
@@ -1745,21 +1769,34 @@ def remove(cfg: dict, pid: str) -> dict:
     if routing.get("fallback") == existing.get("label"):
         raise ProviderInUse(
             "%s e o fallback do roteador mude a rota antes" % pid)
+    # Um slot de rota guarda o NOME DO MODELO (models-set), e a Task 5 grava
+    # esse nome em ATHENA_OLLAMA_MODEL / SENTINEL_OLLAMA_MODEL. Se o modelo
+    # pertence a este provedor, apaga-lo deixaria a variavel pendurada.
+    offered = {existing.get("model") or ""}
+    offered.update(existing.get("models") or [])
+    offered.discard("")
+    for consumer in CONSUMERS:
+        model = routing.get(consumer) or ""
+        if model and model in offered:
+            raise ProviderInUse(
+                "%s fornece %s, que ainda e o modelo de %s mude a rota antes"
+                % (pid, model, consumer))
     out = dict(cfg)
     out["providers"] = [p for p in out["providers"] if p.get("id") != pid]
     return out
 
 
-def _probe_loopback(base: str) -> bool:
-    try:
-        localmodels._assert_loopback(localmodels.normalize_base(base))
-    except ValueError:
-        return False
-    return bool(localmodels.list_models(base)["ok"])
+def _probe_loopback(base: str) -> dict:
+    """Una sonda: `list_models` ja faz o veto de loopback e o pedido HTTP.
+
+    Nao ha segunda verificacao "de seguranca" depois daqui -- o veto acontece
+    dentro de `list_models`, antes de qualquer rede, e os testes da Task 3
+    provem isso. Rodar as duas coisas era sondar a rede duas vezes por clique.
+    """
+    return localmodels.list_models(base)
 
 
-def register(provider: dict, *,
-             runner: Optional[Callable] = None) -> dict:
+def register(provider: dict) -> dict:
     """Confirma o provedor do jeito que o tipo dele permite.
 
     - session: a sessao e do proprio produto; o Thero nao autentica por ele.
@@ -1814,15 +1851,20 @@ def test_endpoint(provider: dict) -> dict:
 
 
 def summary(cfg: dict) -> list:
-    routing = cfg.get("routing") or {}
     rows = []
     for provider in cfg.get("providers", []):
         used_by = [c for c in CONSUMERS
                    if (provider.get("roles") or {}).get(c)]
+        # Um provedor editado pela interface pode chegar sem `kind` (o payload
+        # do formulario nao o traz): cai no tipo do preset, senao a coluna
+        # "tipo" da tela fica vazia para toda entrada do usuario.
+        kind = provider.get("kind") or (
+            presets.provider_preset(provider.get("preset", "")) or {}
+        ).get("kind", "")
         rows.append({
             "id": provider.get("id"),
             "label": provider.get("label"),
-            "kind": provider.get("kind", ""),
+            "kind": kind,
             "base": provider.get("base", ""),
             "model": provider.get("model", ""),
             "authKind": provider.get("authKind", ""),
