@@ -18,17 +18,23 @@ def upsert_block(
     template do comando global): a funcao DETECTA e substitui, nunca injeta --
     injetar duplicaria os marcadores no arquivo. Idempotente: rodar duas
     vezes nao duplica, e o texto depois do marcador final continua la.
+    O `end` e procurado a partir do `start` (senao um marcador final orfao
+    antes do bloco casaria o recorte errado), e o `start` certo e o do par
+    mais proximo desse `end`.
     """
     block = block.strip("\n") + "\n"
 
     if start in existing and end in existing:
         start_index = existing.index(start)
-        end_index = existing.index(end) + len(end)
-        return (
-            existing[:start_index]
-            + block
-            + existing[end_index:].lstrip("\n")
-        )
+        end_index = existing.find(end, start_index)
+        if end_index != -1:
+            end_index += len(end)
+            start_index = existing.rindex(start, 0, end_index)
+            return (
+                existing[:start_index]
+                + block
+                + existing[end_index:].lstrip("\n")
+            )
 
     if existing.strip():
         return existing.rstrip("\n") + "\n\n" + block

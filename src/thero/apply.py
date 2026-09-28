@@ -57,12 +57,18 @@ def _backup(path: Path) -> str:
 
     system.backup.backup_file() faz print() -- otimo no terminal, e o canal da
     ponte e JSON. Aqui o backup e efeito colateral, nao mensagem. Fica na
-    maquina: nunca e versionado nem enviado.
+    maquina: nunca e versionado nem enviado. timestamp() tem resolugao de
+    1 segundo (B2): nome em colisao ganha sufixo _2, _3... ate liberar --
+    backup existente nunca e apagado nem sobrescrito.
     """
     if not path.exists():
         return ""
-    target = path.with_name(
-        "%s.backup_%s%s" % (path.stem, timestamp(), path.suffix))
+    stem = "%s.backup_%s" % (path.stem, timestamp())
+    target = path.with_name(stem + path.suffix)
+    serial = 2
+    while target.exists():
+        target = path.with_name("%s_%d%s" % (stem, serial, path.suffix))
+        serial += 1
     shutil.copy2(str(path), str(target))
     return target.name
 
@@ -83,23 +89,53 @@ def _read_text(path: Path):
     """Le texto SEM corromper -> (texto, encoding_de_escrita) ou None.
 
     Proibido errors="replace" num caminho que regrava: um $PROFILE/config.toml
-    salvo como cp1252 (comum no PowerShell 5.1) viraria U+FFFD escrito de volta
-    -- perda byte a byte. utf-8-sig tolera BOM na leitura (escrevemos sem BOM);
-    cp1252 so quando o utf-8 falha, e ai PRESERVA o cp1252. Nem um nem outro =>
-    None, e o chamador recusa sem tocar no arquivo.
+    salvo como cp1252 (comum no PowerShell 5.1) viraria U+FFFD escrito de
+    volta -- perda byte a byte. utf-8-sig tolera BOM na leitura (escrevemos
+    sem BOM); cp1252 so quando o utf-8 falha, e ai PRESERVA o cp1252. Nem um
+    nem outro => None, e o chamador recusa sem tocar no arquivo. OSError
+    (caminho que e diretorio, alvo sem permissao) tambem vira None (B4): a
+    recusa e limpa, a excecao do SO nao sai do modulo.
     """
     try:
         return path.read_text(encoding="utf-8-sig"), "utf-8"
     except UnicodeDecodeError:
         pass
+    except OSError:
+        return None
     try:
         return path.read_text(encoding="cp1252"), "cp1252"
-    except UnicodeDecodeError:
+    except (UnicodeDecodeError, OSError):
         return None
 
 
 def _refuse(msg: str) -> dict:
     return {"ok": False, "written": "", "backup": "", "msg": msg}
+
+
+def _backup_and_write(path: Path, content: str, encoding: str) -> dict:
+    """Serializa em bytes ANTES de tocar no arquivo (B1/B4).
+
+    write_text() abre e trunca e so entao codifica: alvo salvo em cp1252 com
+    um caractere fora do cp1252 no modelo deixaria o settings.json VAZIO no
+    disco com o erro na janela. Aqui, se o conteudo nao cabe na codificacao
+    do arquivo (ou o SO recua a gravacao -- alvo somente leitura, caminho que
+    e diretorio), a recusa e limpa: backup e escrita so acontecem com os
+    bytes em Mao, e o msg nao ecoa chave nem credencial.
+    """
+    try:
+        payload = content.encode(encoding)
+    except UnicodeEncodeError:
+        return _refuse("o conteudo nao cabe na codificacao %s do arquivo %s"
+                       % (encoding, path.name))
+    try:
+        backup = _backup(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    except OSError:
+        return _refuse("nao consegui escrever em %s: o sistema recusou a"
+                       " gravacao" % path.name)
+    return {"ok": True, "written": str(path), "backup": backup,
+            "msg": "atualizado: %s%s" % (path.name, _backup_note(backup))}
 
 
 def _write_json_target(path: Path, mutate) -> dict:
@@ -124,14 +160,11 @@ def _write_json_target(path: Path, mutate) -> dict:
     else:
         data = {}
     data = mutate(data) or data
-    backup = _backup(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    return _backup_and_write(
+        path,
         json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding=encoding,
+        encoding,
     )
-    return {"ok": True, "written": str(path), "backup": backup,
-            "msg": "atualizado: %s%s" % (path.name, _backup_note(backup))}
 
 
 def apply_claude(agent, cfg: dict, path: Path) -> dict:
@@ -236,21 +269,11 @@ def apply_codex(agent: dict, cfg: dict, path: Path) -> dict:
             out.append("%s = %s" % (key, value))
     out.extend(tail)
 
-    backup = _backup(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(out) + "\n", encoding=encoding)
-    msg = "atualizado: %s%s" % (path.name, _backup_note(backup))
-    if skipped_provider:
-        msg += (": mantive o model_provider do arquivo porque a mesa "
-                "[model_providers.%s] nao existe nele" % skipped_provider)
-    return {"ok": True, "written": str(path), "backup": backup, "msg": msg}
-
-
-def provider_base(cfg: dict, provider_id: str) -> str:
-    provider = next((p for p in cfg.get("providers", [])
-                     if p.get("id") == provider_id), None)
-    base = (provider or {}).get("base") or ""
-    return base or OLLAMA_DEFAULT_HOST
+    result = _backup_and_write(path, "\n".join(out) + "\n", encoding)
+    if skipped_provider and result["ok"]:
+        result["msg"] += (": mantive o model_provider do arquivo porque a "
+                "mesa [model_providers.%s] nao existe nele" % skipped_provider)
+    return result
 
 
 # Um par de variaveis por consumidor, com o nome exato que cada um le no
@@ -322,15 +345,15 @@ def apply_profile(cfg: dict, profile) -> dict:
         existing, encoding = read
     elif not profile.parent.exists():
         return _refuse("pasta da $PROFILE nao existe: %s" % profile.parent)
-    backup = _backup(profile)
-    profile.parent.mkdir(parents=True, exist_ok=True)
-    profile.write_text(
+    result = _backup_and_write(
+        profile,
         upsert_block(existing, block, ENV_MARKER_START, ENV_MARKER_END),
-        encoding=encoding,
+        encoding,
     )
-    return {"ok": True, "written": str(profile), "backup": backup,
-            "msg": "ambiente Athena/Sentinel atualizado na $PROFILE%s"
-                   % _backup_note(backup)}
+    if result["ok"]:
+        result["msg"] = ("ambiente Athena/Sentinel atualizado na $PROFILE%s"
+                         % _backup_note(result["backup"]))
+    return result
 
 
 TARGETS = ("claude", "opencode", "codex", "profile")

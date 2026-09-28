@@ -2444,7 +2444,8 @@ a atual delegando — comportamento das chamadas existentes não muda.
 deste plano com o código real verificada por execução: os blocos dos Steps 3 e 4 são
 byte-idênticos às funções upsert de `src/thero/shell_command/__init__.py` e a
 `src/thero/apply.py`; o bloco do Step 1 é cópia verbatim de `tests/test_apply.py`
-como existe hoje (32 testes, incluindo o requisito de `backup`). Antes disto, o plano
+como existe hoje (38 testes, incluindo o requisito de `backup` e os cinco itens
+da pós-revisão B1-B5). Antes disto, o plano
 trazia o bloco de testes na versão pré-auditoria (18 testes, assinatura velha de
 `apply_claude`) — executado verbatim contra o código atual, colhia 7 falhas.
 Arquivo real = fonte da verdade.**
@@ -2481,6 +2482,34 @@ Arquivo real = fonte da verdade.**
 - **Produto — backup e aviso na tela.** Todo retorno traz `"backup"` (nome do
   arquivo criado, ou `""` quando não houve) e o `msg` menciona o que foi
   tocado. O backup fica na máquina, nunca é versionado nem enviado.
+
+**Correções da pós-revisão da Task 5 (B1-B5), já costuradas nos blocos acima.**
+
+- **B1 — serializar antes de tocar.** `_backup_and_write` codifica o conteúdo
+  final em `bytes` DENTRO de um `try/except UnicodeEncodeError` antes de
+  backup e escrita (`write_bytes`): alvo salvo em cp1252 + modelo com caractere
+  fora do cp1252 (ex.: U+2192) era truncado pelo `write_text` e estourava na
+  janela com o arquivo vazio no disco. Agora: recusa limpa, arquivo intocado,
+  nenhum backup órfão, e o `msg` diz que o conteúdo não cabe na codificação —
+  sem ecoar valor de chave nem credencial.
+- **B2 — colisão de nome de backup.** `timestamp()` tem resolução de 1
+  segundo; duas escritas no mesmo alvo no mesmo segundo faziam o 2º backup
+  sobrescrever o 1º. Nome em colisao ganha sufixo `_2`, `_3`, ... até livre;
+  backup existente nunca é apagado nem sobrescrito (sem expurgo inventado).
+- **B3 — `end` órfão antes do bloco.** Em `upsert_block`, o `end` é procurado
+  a partir do `start` (`find(end, start_index)`) e o `start` do bloco
+  gerenciado é o par mais próximo desse `end` (`rindex(start, 0, end_index)`):
+  um marcador final colado pelo usuário antes do bloco quebrava a idempotência
+  e duplicava o bloco a cada aplicação. Sem `end` após o `start`, cai no
+  caminho de acréscimo (nada de `ValueError`). `upsert_marked_block` (2 args)
+  e os consumidores do comando global seguem intactos — suíte inteira passa.
+- **B4 — erro do SO vira recusa.** `_read_text` captura `OSError` (caminho que
+  é diretório, alvo sem permissão) devolvendo `None`, e backup+escrita vão
+  dentro de `try/except OSError`: a ponte recebe `{"ok": False, ...}` com o
+  nome do arquivo no `msg`, sem traceback e sem exceção do SO para fora.
+- **B5 — código morto removido.** `provider_base()` não tinha nenhum chamador
+  em `src/`, `tests/` nem na ponte da Task 8 (que usa `default_paths`,
+  `find_agent`, `apply_agent`, `apply_all`); foi removido de `apply.py`.
 
 - [ ] **Step 1: Testes**
 
@@ -2534,6 +2563,39 @@ def test_upsert_block_does_not_cannibalize_other_marked_blocks():
     assert ">>Y\nbeta\n<<Y" in out
     out2 = upsert_block(out, ">>Y\nBETA\n<<Y", ">>Y", "<<Y")
     assert "BETA" in out2 and ">>X\nALPHA\n<<X" in out2
+
+
+def test_upsert_block_ignores_orphan_end_before_the_block():
+    # B3: um marcador `end` orfao ANTES do bloco (comentario/exemplo colado
+    # pelo usuario no $PROFILE) fazia index(end) achar o fim errado: o
+    # recorte pegava o trecho errado, o bloco velho sobrevivia e duplicava a
+    # cada aplicacao -- exatamente o que a idempotencia promete impedir.
+    existing = "<<<\ncomentario do usuario\n>>>\nvelho\n<<<\nfim\n"
+    first = upsert_block(existing, ">>>\nnovo\n<<<", ">>>", "<<<")
+    assert "velho" not in first
+    second = upsert_block(first, ">>>\nnovo\n<<<", ">>>", "<<<")
+    assert second.count(">>>") == 1
+    assert "comentario do usuario" in second and "fim" in second
+
+
+def test_upsert_block_swaps_the_block_that_has_its_own_end():
+    # B3 (contrapartida): com mais de um `start`, o recorte comeca no start
+    # do bloco GERENCIADO (o par mais proximo do end), nao na primeira
+    # ocorrencia -- o texto entre um start orfao e o bloco real sobrevive.
+    existing = ">>>\nexemplo solto\n>>>\nvelho\n<<<\nfim\n"
+    out = upsert_block(existing, ">>>\nnovo\n<<<", ">>>", "<<<")
+    assert "velho" not in out and "novo" in out
+    assert "exemplo solto" in out
+
+
+def test_upsert_block_appends_when_no_end_follows_the_start():
+    # Guarda do B3: procurar o `end` a partir do `start` nao pode estourar
+    # ValueError quando so existe `end` antes do `start` -- ai nao ha bloco
+    # gerenciado completo, e o caminho e o mesmo de acrescentar.
+    existing = "<<< exemplo\n>>>\nabc\n"
+    out = upsert_block(existing, ">>>\nnovo\n<<<", ">>>", "<<<")
+    assert "novo" in out and "abc" in out
+    assert out.count(">>>") == 2
 
 
 def test_marked_block_still_uses_the_command_markers():
@@ -2790,6 +2852,24 @@ def test_apply_refuses_an_undecodable_file_and_writes_nothing(tmp_path, cfg):
     assert out["backup"] == ""
 
 
+def test_apply_refuses_unencodable_content_without_truncating(tmp_path, cfg):
+    # B1: alvo salvo em cp1252 + modelo com caractere fora do cp1252 (ex.:
+    # U+2192). write_text() abre e TRUNCA antes de codificar: sem serializar
+    # os bytes primeiro, o settings.json chegaria vazio no disco com o erro
+    # na janela. Aqui: recusa limpa, conteudo original byte a byte, zero
+    # backup orphan, e o msg diz que o conteudo nao cabe na codificacao.
+    target = tmp_path / "settings.json"
+    original = b'{"note": "caf\xe9"}'
+    target.write_bytes(original)
+    agent = dict(cfg["agents"][0], model="claude\u2192pro")
+    out = apply.apply_claude(agent, cfg, target)
+    assert out["ok"] is False
+    assert target.read_bytes() == original
+    assert list(tmp_path.glob("settings.backup_*")) == []
+    assert out["backup"] == ""
+    assert "codificacao" in out["msg"].lower()
+
+
 # ---- despacho / record-only / ponte ----
 
 def test_apply_never_uses_print_on_the_bridge_channel(tmp_path, cfg, capsys):
@@ -2853,11 +2933,46 @@ def test_apply_returns_the_backup_name_when_overwriting(tmp_path, cfg):
     assert out["backup"] in out["msg"]     # msg menciona o que foi tocado
 
 
+def test_apply_refuses_when_the_os_blocks_the_write(tmp_path, cfg):
+    # B4: caminho que e um diretorio (ou alvo somente leitura) nao pode
+    # estourar IsADirectoryError/PermissionError para fora do modulo: a
+    # ponte espera a recusa habitual, com o nome do arquivo no msg, sem
+    # traceback e sem backup orphan criado ao lado.
+    target = tmp_path / "settings.json"
+    target.mkdir()
+    out = apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
+    assert out["ok"] is False
+    assert "settings.json" in out["msg"]
+    assert list(tmp_path.glob("settings.backup_*")) == []
+    assert target.is_dir()
+
+
 def test_apply_backup_is_empty_when_no_prior_file(tmp_path, cfg):
     target = tmp_path / "settings.json"
     out = apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
     assert out["backup"] == ""             # arquivo novo: nao houve backup
     assert "settings.json" in out["msg"]
+
+
+def test_backup_names_do_not_collide_in_the_same_second(tmp_path, cfg,
+                                                        monkeypatch):
+    # B2: timestamp() tem resolucao de 1 segundo; duas escritas no mesmo alvo
+    # dentro do mesmo segundo faziam o 2o backup sobrescrever o 1o e o
+    # conteudo original mais antigo se perdia. Nome em colisao ganha sufixo
+    # _2, _3... (nada e apagado nem sobrescrito). Controle explicito do
+    # timestamp, sem sleep.
+    monkeypatch.setattr(apply, "timestamp", lambda: "20260928_120000")
+    target = tmp_path / "settings.json"
+    original = json.dumps({"env": {"X": "1"}})
+    target.write_text(original, encoding="utf-8")
+    agent = apply.find_agent(cfg, "claude")
+    apply.apply_claude(agent, cfg, target)
+    after_first = target.read_text(encoding="utf-8")
+    apply.apply_claude(agent, cfg, target)
+    backups = sorted(tmp_path.glob("settings.backup_*"))
+    assert len(backups) == 2
+    assert backups[0].read_text(encoding="utf-8") == original
+    assert backups[1].read_text(encoding="utf-8") == after_first
 ```
 
 - [ ] **Step 2: Rodar para confirmar falha**
@@ -2883,17 +2998,23 @@ def upsert_block(
     template do comando global): a funcao DETECTA e substitui, nunca injeta --
     injetar duplicaria os marcadores no arquivo. Idempotente: rodar duas
     vezes nao duplica, e o texto depois do marcador final continua la.
+    O `end` e procurado a partir do `start` (senao um marcador final orfao
+    antes do bloco casaria o recorte errado), e o `start` certo e o do par
+    mais proximo desse `end`.
     """
     block = block.strip("\n") + "\n"
 
     if start in existing and end in existing:
         start_index = existing.index(start)
-        end_index = existing.index(end) + len(end)
-        return (
-            existing[:start_index]
-            + block
-            + existing[end_index:].lstrip("\n")
-        )
+        end_index = existing.find(end, start_index)
+        if end_index != -1:
+            end_index += len(end)
+            start_index = existing.rindex(start, 0, end_index)
+            return (
+                existing[:start_index]
+                + block
+                + existing[end_index:].lstrip("\n")
+            )
 
     if existing.strip():
         return existing.rstrip("\n") + "\n\n" + block
@@ -2986,12 +3107,18 @@ def _backup(path: Path) -> str:
 
     system.backup.backup_file() faz print() -- otimo no terminal, e o canal da
     ponte e JSON. Aqui o backup e efeito colateral, nao mensagem. Fica na
-    maquina: nunca e versionado nem enviado.
+    maquina: nunca e versionado nem enviado. timestamp() tem resolugao de
+    1 segundo (B2): nome em colisao ganha sufixo _2, _3... ate liberar --
+    backup existente nunca e apagado nem sobrescrito.
     """
     if not path.exists():
         return ""
-    target = path.with_name(
-        "%s.backup_%s%s" % (path.stem, timestamp(), path.suffix))
+    stem = "%s.backup_%s" % (path.stem, timestamp())
+    target = path.with_name(stem + path.suffix)
+    serial = 2
+    while target.exists():
+        target = path.with_name("%s_%d%s" % (stem, serial, path.suffix))
+        serial += 1
     shutil.copy2(str(path), str(target))
     return target.name
 
@@ -3012,23 +3139,53 @@ def _read_text(path: Path):
     """Le texto SEM corromper -> (texto, encoding_de_escrita) ou None.
 
     Proibido errors="replace" num caminho que regrava: um $PROFILE/config.toml
-    salvo como cp1252 (comum no PowerShell 5.1) viraria U+FFFD escrito de volta
-    -- perda byte a byte. utf-8-sig tolera BOM na leitura (escrevemos sem BOM);
-    cp1252 so quando o utf-8 falha, e ai PRESERVA o cp1252. Nem um nem outro =>
-    None, e o chamador recusa sem tocar no arquivo.
+    salvo como cp1252 (comum no PowerShell 5.1) viraria U+FFFD escrito de
+    volta -- perda byte a byte. utf-8-sig tolera BOM na leitura (escrevemos
+    sem BOM); cp1252 so quando o utf-8 falha, e ai PRESERVA o cp1252. Nem um
+    nem outro => None, e o chamador recusa sem tocar no arquivo. OSError
+    (caminho que e diretorio, alvo sem permissao) tambem vira None (B4): a
+    recusa e limpa, a excecao do SO nao sai do modulo.
     """
     try:
         return path.read_text(encoding="utf-8-sig"), "utf-8"
     except UnicodeDecodeError:
         pass
+    except OSError:
+        return None
     try:
         return path.read_text(encoding="cp1252"), "cp1252"
-    except UnicodeDecodeError:
+    except (UnicodeDecodeError, OSError):
         return None
 
 
 def _refuse(msg: str) -> dict:
     return {"ok": False, "written": "", "backup": "", "msg": msg}
+
+
+def _backup_and_write(path: Path, content: str, encoding: str) -> dict:
+    """Serializa em bytes ANTES de tocar no arquivo (B1/B4).
+
+    write_text() abre e trunca e so entao codifica: alvo salvo em cp1252 com
+    um caractere fora do cp1252 no modelo deixaria o settings.json VAZIO no
+    disco com o erro na janela. Aqui, se o conteudo nao cabe na codificacao
+    do arquivo (ou o SO recua a gravacao -- alvo somente leitura, caminho que
+    e diretorio), a recusa e limpa: backup e escrita so acontecem com os
+    bytes em Mao, e o msg nao ecoa chave nem credencial.
+    """
+    try:
+        payload = content.encode(encoding)
+    except UnicodeEncodeError:
+        return _refuse("o conteudo nao cabe na codificacao %s do arquivo %s"
+                       % (encoding, path.name))
+    try:
+        backup = _backup(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    except OSError:
+        return _refuse("nao consegui escrever em %s: o sistema recusou a"
+                       " gravacao" % path.name)
+    return {"ok": True, "written": str(path), "backup": backup,
+            "msg": "atualizado: %s%s" % (path.name, _backup_note(backup))}
 
 
 def _write_json_target(path: Path, mutate) -> dict:
@@ -3053,14 +3210,11 @@ def _write_json_target(path: Path, mutate) -> dict:
     else:
         data = {}
     data = mutate(data) or data
-    backup = _backup(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    return _backup_and_write(
+        path,
         json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding=encoding,
+        encoding,
     )
-    return {"ok": True, "written": str(path), "backup": backup,
-            "msg": "atualizado: %s%s" % (path.name, _backup_note(backup))}
 
 
 def apply_claude(agent, cfg: dict, path: Path) -> dict:
@@ -3165,21 +3319,11 @@ def apply_codex(agent: dict, cfg: dict, path: Path) -> dict:
             out.append("%s = %s" % (key, value))
     out.extend(tail)
 
-    backup = _backup(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(out) + "\n", encoding=encoding)
-    msg = "atualizado: %s%s" % (path.name, _backup_note(backup))
-    if skipped_provider:
-        msg += (": mantive o model_provider do arquivo porque a mesa "
-                "[model_providers.%s] nao existe nele" % skipped_provider)
-    return {"ok": True, "written": str(path), "backup": backup, "msg": msg}
-
-
-def provider_base(cfg: dict, provider_id: str) -> str:
-    provider = next((p for p in cfg.get("providers", [])
-                     if p.get("id") == provider_id), None)
-    base = (provider or {}).get("base") or ""
-    return base or OLLAMA_DEFAULT_HOST
+    result = _backup_and_write(path, "\n".join(out) + "\n", encoding)
+    if skipped_provider and result["ok"]:
+        result["msg"] += (": mantive o model_provider do arquivo porque a "
+                "mesa [model_providers.%s] nao existe nele" % skipped_provider)
+    return result
 
 
 # Um par de variaveis por consumidor, com o nome exato que cada um le no
@@ -3251,15 +3395,15 @@ def apply_profile(cfg: dict, profile) -> dict:
         existing, encoding = read
     elif not profile.parent.exists():
         return _refuse("pasta da $PROFILE nao existe: %s" % profile.parent)
-    backup = _backup(profile)
-    profile.parent.mkdir(parents=True, exist_ok=True)
-    profile.write_text(
+    result = _backup_and_write(
+        profile,
         upsert_block(existing, block, ENV_MARKER_START, ENV_MARKER_END),
-        encoding=encoding,
+        encoding,
     )
-    return {"ok": True, "written": str(profile), "backup": backup,
-            "msg": "ambiente Athena/Sentinel atualizado na $PROFILE%s"
-                   % _backup_note(backup)}
+    if result["ok"]:
+        result["msg"] = ("ambiente Athena/Sentinel atualizado na $PROFILE%s"
+                         % _backup_note(result["backup"]))
+    return result
 
 
 TARGETS = ("claude", "opencode", "codex", "profile")
@@ -3310,7 +3454,10 @@ def apply_all(cfg: dict, paths: dict,
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `362 + 32 = 394 passed` (baseline atual da Task 4 e 362, nao 319; os testes antigos do comando global cobrem o `upsert_marked_block` delegado e continuam passando).
+Expected: `394 + 6 = 400 passed` (baseline atual da Task 5 revisada e 394, nao
+362; os 6 novos sao os testes B1-B4 desta correcao — `test_apply.py` passou de
+32 para 38 testes; os testes antigos do comando global cobrem o
+`upsert_marked_block` delegado e continuam passando).
 
 - [ ] **Step 6: Commit (pedir confirmação)**
 

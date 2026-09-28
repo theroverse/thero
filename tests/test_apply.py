@@ -47,6 +47,39 @@ def test_upsert_block_does_not_cannibalize_other_marked_blocks():
     assert "BETA" in out2 and ">>X\nALPHA\n<<X" in out2
 
 
+def test_upsert_block_ignores_orphan_end_before_the_block():
+    # B3: um marcador `end` orfao ANTES do bloco (comentario/exemplo colado
+    # pelo usuario no $PROFILE) fazia index(end) achar o fim errado: o
+    # recorte pegava o trecho errado, o bloco velho sobrevivia e duplicava a
+    # cada aplicacao -- exatamente o que a idempotencia promete impedir.
+    existing = "<<<\ncomentario do usuario\n>>>\nvelho\n<<<\nfim\n"
+    first = upsert_block(existing, ">>>\nnovo\n<<<", ">>>", "<<<")
+    assert "velho" not in first
+    second = upsert_block(first, ">>>\nnovo\n<<<", ">>>", "<<<")
+    assert second.count(">>>") == 1
+    assert "comentario do usuario" in second and "fim" in second
+
+
+def test_upsert_block_swaps_the_block_that_has_its_own_end():
+    # B3 (contrapartida): com mais de um `start`, o recorte comeca no start
+    # do bloco GERENCIADO (o par mais proximo do end), nao na primeira
+    # ocorrencia -- o texto entre um start orfao e o bloco real sobrevive.
+    existing = ">>>\nexemplo solto\n>>>\nvelho\n<<<\nfim\n"
+    out = upsert_block(existing, ">>>\nnovo\n<<<", ">>>", "<<<")
+    assert "velho" not in out and "novo" in out
+    assert "exemplo solto" in out
+
+
+def test_upsert_block_appends_when_no_end_follows_the_start():
+    # Guarda do B3: procurar o `end` a partir do `start` nao pode estourar
+    # ValueError quando so existe `end` antes do `start` -- ai nao ha bloco
+    # gerenciado completo, e o caminho e o mesmo de acrescentar.
+    existing = "<<< exemplo\n>>>\nabc\n"
+    out = upsert_block(existing, ">>>\nnovo\n<<<", ">>>", "<<<")
+    assert "novo" in out and "abc" in out
+    assert out.count(">>>") == 2
+
+
 def test_marked_block_still_uses_the_command_markers():
     block = "%s\nfunction thero {}\n%s" % (COMMAND_MARKER_START,
                                            COMMAND_MARKER_END)
@@ -301,6 +334,24 @@ def test_apply_refuses_an_undecodable_file_and_writes_nothing(tmp_path, cfg):
     assert out["backup"] == ""
 
 
+def test_apply_refuses_unencodable_content_without_truncating(tmp_path, cfg):
+    # B1: alvo salvo em cp1252 + modelo com caractere fora do cp1252 (ex.:
+    # U+2192). write_text() abre e TRUNCA antes de codificar: sem serializar
+    # os bytes primeiro, o settings.json chegaria vazio no disco com o erro
+    # na janela. Aqui: recusa limpa, conteudo original byte a byte, zero
+    # backup orphan, e o msg diz que o conteudo nao cabe na codificacao.
+    target = tmp_path / "settings.json"
+    original = b'{"note": "caf\xe9"}'
+    target.write_bytes(original)
+    agent = dict(cfg["agents"][0], model="claude\u2192pro")
+    out = apply.apply_claude(agent, cfg, target)
+    assert out["ok"] is False
+    assert target.read_bytes() == original
+    assert list(tmp_path.glob("settings.backup_*")) == []
+    assert out["backup"] == ""
+    assert "codificacao" in out["msg"].lower()
+
+
 # ---- despacho / record-only / ponte ----
 
 def test_apply_never_uses_print_on_the_bridge_channel(tmp_path, cfg, capsys):
@@ -364,8 +415,43 @@ def test_apply_returns_the_backup_name_when_overwriting(tmp_path, cfg):
     assert out["backup"] in out["msg"]     # msg menciona o que foi tocado
 
 
+def test_apply_refuses_when_the_os_blocks_the_write(tmp_path, cfg):
+    # B4: caminho que e um diretorio (ou alvo somente leitura) nao pode
+    # estourar IsADirectoryError/PermissionError para fora do modulo: a
+    # ponte espera a recusa habitual, com o nome do arquivo no msg, sem
+    # traceback e sem backup orphan criado ao lado.
+    target = tmp_path / "settings.json"
+    target.mkdir()
+    out = apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
+    assert out["ok"] is False
+    assert "settings.json" in out["msg"]
+    assert list(tmp_path.glob("settings.backup_*")) == []
+    assert target.is_dir()
+
+
 def test_apply_backup_is_empty_when_no_prior_file(tmp_path, cfg):
     target = tmp_path / "settings.json"
     out = apply.apply_claude(apply.find_agent(cfg, "claude"), cfg, target)
     assert out["backup"] == ""             # arquivo novo: nao houve backup
     assert "settings.json" in out["msg"]
+
+
+def test_backup_names_do_not_collide_in_the_same_second(tmp_path, cfg,
+                                                        monkeypatch):
+    # B2: timestamp() tem resolucao de 1 segundo; duas escritas no mesmo alvo
+    # dentro do mesmo segundo faziam o 2o backup sobrescrever o 1o e o
+    # conteudo original mais antigo se perdia. Nome em colisao ganha sufixo
+    # _2, _3... (nada e apagado nem sobrescrito). Controle explicito do
+    # timestamp, sem sleep.
+    monkeypatch.setattr(apply, "timestamp", lambda: "20260928_120000")
+    target = tmp_path / "settings.json"
+    original = json.dumps({"env": {"X": "1"}})
+    target.write_text(original, encoding="utf-8")
+    agent = apply.find_agent(cfg, "claude")
+    apply.apply_claude(agent, cfg, target)
+    after_first = target.read_text(encoding="utf-8")
+    apply.apply_claude(agent, cfg, target)
+    backups = sorted(tmp_path.glob("settings.backup_*"))
+    assert len(backups) == 2
+    assert backups[0].read_text(encoding="utf-8") == original
+    assert backups[1].read_text(encoding="utf-8") == after_first
