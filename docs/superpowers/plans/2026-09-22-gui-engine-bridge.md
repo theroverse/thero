@@ -3508,9 +3508,12 @@ Fatos que mandam aqui:
   apagamento do módulo, contrário à política da tabela acima e sem teste. Passa a mover a
   cópia antiga para a quarentena (parâmetro `quarantine` opcional, mesmo shape do
   `uninstall`), agora coberto por teste.
+- **A14** — consequência da A13: "importar" a própria pasta já instalada (origem == alvo)
+  moveria a skill inteira para a quarentena e depois quebraria ao copiar o que sumiu.
+  Entra antes disso uma recusa limpa por caminho resolvido, com teste.
 - **Baseline** — a cadeia `337 + 13 = 350` era aritmética de duas rodadas atrás. Baseline
-  medido hoje: **400 passed** (fim da Task 5 revisada). Esta seção prescreve **15**
-  `def test_` → `400 + 15 = 415`. As cadeias das Tasks 7+ continuam com bases antigas e
+  medido hoje: **400 passed** (fim da Task 5 revisada). Esta seção prescreve **16**
+  `def test_` → `400 + 16 = 416`. As cadeias das Tasks 7+ continuam com bases antigas e
   cada executor deve recalculá-las contra o baseline real, como foi feito na Task 5.
 
 - [ ] **Step 1: Testes**
@@ -3661,6 +3664,18 @@ def test_import_over_a_user_folder_quarantines_the_old_copy(tmp_path, base):
         encoding="utf-8")
 
 
+def test_import_refuses_the_folder_that_is_already_installed(tmp_path,
+                                                             base):
+    # A14: origem == alvo. Sem a guarda, a propria skill da tela iria para a
+    # quarentena e a copia seguinte quebraria sobre o caminho vazio.
+    q = tmp_path / "q"
+    mine = base / "minha-skill"
+    out = skillstate.import_skill(mine, base_dir=base, quarantine=q)
+    assert out["ok"] is False
+    assert (mine / "SKILL.md").exists()
+    assert not q.exists()
+
+
 def test_search_filters_the_known_catalog_and_labels_the_source(base):
     rows = skillstate.search("postgres", base_dir=base)
     assert rows
@@ -3706,7 +3721,9 @@ def test_manifest_round_trip_records_origin_but_never_invents_files(tmp_path):
 - [ ] **Step 2: Rodar para confirmar falha**
 
 Run: `python -m pytest tests/test_skillstate.py -q`
-Expected: FAIL — `ModuleNotFoundError: No module named 'thero.skillstate'`
+Expected: FAIL — erro de coleção no import do módulo que ainda não existe
+(`ImportError: cannot import name 'skillstate' from 'thero'`, porque o `from
+thero import skillstate` resolve o pacote antes de procurar o submódulo).
 
 - [ ] **Step 3: Implementação**
 
@@ -3774,11 +3791,12 @@ def thero_skill_names() -> set:
 
 
 def _read_skill_md(folder: Path) -> str:
-    """Texto do SKILL.md para EXIBIR, sem `errors="replace"`.
+    """Texto do SKILL.md para EXIBIR, sem fingir que leu.
 
     utf-8-sig tolera BOM; cai para cp1252 (o que o PowerShell 5.1 escreve)
     so quando o utf-8 falha. Falhou nas duas -> vazio, e a linha sai sem
-    descricao: nao finjo que li o que nao cabe em nenhuma codificacao.
+    descricao: substituir byte ilegivel por U+FFFD produziria texto inventado
+    na tela (mesma regra de `_read_text` em `apply.py`).
     """
     try:
         return (folder / "SKILL.md").read_text(encoding="utf-8-sig")
@@ -3913,10 +3931,16 @@ def import_skill(source: Path, base_dir: Optional[Path] = None,
     root = Path(base_dir) if base_dir else skills_base(local)
     root.mkdir(parents=True, exist_ok=True)
     target = root / src.name
+    if target.exists() and target.resolve() == src.resolve():
+        # A14: a origem JA e o alvo -- mover para a quarentena aqui apagaria
+        # a skill da propria tela antes de copiar o que nao existe mais.
+        return {"ok": False,
+                "msg": "%s ja e a pasta instalada: nao ha o que importar "
+                       "sobre ela" % src}
     replaced = ""
     if target.exists():
         # A13: a copia antiga e do usuario e pode ter trabalho dentro -- vai
-        # para a quarentena em vez de rmtree, e so depois disso a nova entra.
+        # para a quarentena (mesma regra do uninstall) antes da nova entrar.
         aside = _unique_quarantine_target(
             Path(quarantine) if quarantine else quarantine_dir(), src.name)
         shutil.move(str(target), str(aside))
@@ -3953,7 +3977,7 @@ def save_manifest(manifest: dict, path: Optional[Path] = None) -> Path:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `400 + 15 = 415 passed` — o baseline de 400 e o medido no fim da Task 5
+Expected: `400 + 16 = 416 passed` — o baseline de 400 e o medido no fim da Task 5
 revisada (fora daqui, as cadeias das Tasks 7+ ainda tem bases antigas e precisam
 ser recalculadas por quem as executa).
 
