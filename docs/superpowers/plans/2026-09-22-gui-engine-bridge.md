@@ -1428,6 +1428,19 @@ def test_loopback_spellings_are_all_accepted():
         assert localmodels._assert_loopback(base) == base
 
 
+def test_guard_base_gates_a_remote_host_before_any_network(monkeypatch):
+    # Publico por causa da Task 4 (providers.register): um satellite precisa
+    # recusar host remoto ANTES de montar o payload de escrita de config, sem
+    # compor os privados (_guard/_assert_loopback) de outro satellite. O veto e
+    # so de URL -- o urlopen fakeado prova que nenhuma chamada sai daqui.
+    fake = FakeUrlopen()
+    monkeypatch.setattr(localmodels, "urlopen", fake)
+    assert localmodels.guard_base("localhost:11434") == "http://localhost:11434"
+    with pytest.raises(ValueError):
+        localmodels.guard_base("http://10.0.0.5:11434")
+    assert fake.calls == []
+
+
 def test_pull_streams_lines_then_exits(monkeypatch):
     body = b"".join(
         json.dumps({"status": "downloading %d%%" % p}).encode() + b"\n"
@@ -1766,6 +1779,12 @@ def _guard(base: str) -> str:
     return _assert_loopback(normalize_base(base))
 
 
+# Publico por contrato da Task 4 (providers.register): um satellite precisa
+# recusar host remoto ANTES de montar o payload de escrita de config, e nao
+# deve compor os privados (_guard/_assert_loopback) de outro satellite.
+guard_base = _guard
+
+
 def _describe(error: Exception, base: str) -> str:
     if isinstance(error, urllib.error.HTTPError):
         return "HTTP %d %s" % (error.code, error.reason or "")
@@ -1964,7 +1983,9 @@ def status(base: str = "") -> dict:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `276 + 29 = 305 passed` (28 em `test_localmodels.py` + a correção da
+Expected: `276 + 30 = 306 passed` (29 em `test_localmodels.py`, sendo os 28 originais
++ o teste `test_guard_base_gates_a_remote_host_before_any_network` que a Task 4
+exige ao expor `guard_base` -- ver Passo 0 -- e a correção da
 Task 2: o teste novo de `test_envreport.py` que amarra `_ollama_probe()` ao
 contrato real de `localmodels.status()`)
 
@@ -1993,7 +2014,27 @@ git commit -m "feat(models): loopback-only Ollama client for the local models sc
    (Task 8) chama `providers.register(provider)`.
 4. `summary()` cai no `kind` do preset quando a entrada não traz o campo.
 5. `_probe_loopback` virou uma sonda só (o veto de loopback já vive dentro de
-   `localmodels.list_models`), eliminando o pedido HTTP duplo por registro.
+   `localmodels.list_models`), eliminando o pedido HTTP duplo por clique. **E
+   ele devolve dict**: `if _probe_loopback(base):` seria sempre verdade (`{"ok":
+   False}` é truthy) e diria "endpoint respondeu" com o Ollama caído — por isso
+   `register` consulta `["ok"]`.
+6. `register` **não** recompõe mais o veto a partir dos privados
+   `localmodels._assert_loopback` + `normalize_base`. A Task 3 expõe
+   `guard_base(base)` (público, mesma coisa que o `_guard` interno) e o
+   `providers` usa só isso — um satellite não depende de nome privado de outro.
+7. **Alinhamentos de texto desta task (antes do código).** (a) O `guard_base`
+   do item 6 ainda não existia no `localmodels.py` commitado da Task 3 — o
+   Passo 0 da Task 4 o expõe (alias público de `_guard`) e fixa o contrato com
+   um teste em `test_localmodels.py`; os blocos de código/teste da Task 3 acima
+   foram atualizados para ficarem byte-idênticos ao arquivo final, e a cadeia
+   de contagens passou de 305 para 306 na Task 3 (e +1 em cada task a jusante).
+   (b) O Step 2 dizia `ModuleNotFoundError: No module named 'thero.providers'`;
+   o pacote `thero` já existe (Tasks 1-3), então o erro real é
+   `ImportError: cannot import name 'providers' from 'thero'` — mesmo caso do
+   Step 2 da Task 3. (c) O `FakeResponse` do teste de registro `local` estava
+   num bloco separado ("no topo do arquivo"); foi fundido ao bloco único de
+   `tests/test_providers.py` para o trecho prescrito ficar byte-idêntico ao
+   arquivo final.
 
 - [ ] **Step 1: Testes**
 
@@ -2005,6 +2046,17 @@ import json
 import pytest
 
 from thero import providers
+
+
+class FakeResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return b'{"models": []}'
 
 
 CFG = {
@@ -2145,24 +2197,13 @@ def test_summary_marks_which_apps_use_which_provider():
     assert by_id["openai"]["usedBy"] == ["sentinel"]
 ```
 
-`FakeResponse` no topo do arquivo:
-
-```python
-class FakeResponse:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def read(self):
-        return b'{"models": []}'
-```
-
 - [ ] **Step 2: Rodar para confirmar falha**
 
 Run: `python -m pytest tests/test_providers.py -q`
-Expected: FAIL — `ModuleNotFoundError: No module named 'thero.providers'`
+Expected: FAIL — `ImportError: cannot import name 'providers' from 'thero'`
+(o pacote `thero` ja existe por causa das Tasks 1-3, entao o erro e de import
+de nome dentro do pacote, nao `ModuleNotFoundError` -- mesma raiz do Step 2 da
+Task 3: o modulo ainda nao existe)
 
 - [ ] **Step 3: Implementação**
 
@@ -2253,6 +2294,10 @@ def _probe_loopback(base: str) -> dict:
     Nao ha segunda verificacao "de seguranca" depois daqui -- o veto acontece
     dentro de `list_models`, antes de qualquer rede, e os testes da Task 3
     provem isso. Rodar as duas coisas era sondar a rede duas vezes por clique.
+
+    DEVOLVE UM DICT. `if _probe_loopback(base):` e sempre verdade -- um
+    `{"ok": False}` dict e truthy e a tela diria "endpoint respondeu" com o
+    Ollama caido. Por isso o `register` abaixo consulta `["ok"]`, nao o dict.
     """
     return localmodels.list_models(base)
 
@@ -2274,11 +2319,14 @@ def register(provider: dict) -> dict:
             return {"ok": False, "authState": "incompleto",
                     "msg": "informe o endpoint local antes de registrar"}
         try:
-            localmodels._assert_loopback(localmodels.normalize_base(base))
+            url_base = localmodels.guard_base(base)
         except ValueError as exc:
             return {"ok": False, "authState": "bloqueado",
                     "msg": "modelos locais so por loopback: %s" % exc}
-        if _probe_loopback(base):
+        # `["ok"]`, nunca o dict: `{"ok": False}` e truthy, e o registro sairia
+        # confirmado com o Ollama caido.
+        probe = _probe_loopback(url_base)
+        if probe["ok"]:
             return {"ok": True, "authState": "respondeu",
                     "msg": "endpoint local respondeu - provedor registrado"}
         return {"ok": False, "authState": "sem resposta",
@@ -2367,7 +2415,7 @@ def blank_from_preset(pid: str, label: str = "") -> dict:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `305 + 13 = 318 passed`
+Expected: `306 + 13 = 319 passed`
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -2967,7 +3015,7 @@ def apply_all(cfg: dict, paths: dict,
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `318 + 18 = 336 passed` (os testes antigos do comando global cobrem o `upsert_marked_block` delegado e continuam passando)
+Expected: `319 + 18 = 337 passed` (os testes antigos do comando global cobrem o `upsert_marked_block` delegado e continuam passando)
 
 - [ ] **Step 6: Commit (pedir confirmação)**
 
@@ -3351,7 +3399,7 @@ def save_manifest(manifest: dict, path: Optional[Path] = None) -> Path:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `336 + 13 = 349 passed`
+Expected: `337 + 13 = 350 passed`
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -3552,7 +3600,7 @@ reatribuição por:
 - [ ] **Step 4: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `349 + 6 = 355 passed` (os testes que cobriam `run_command` continuam passando — comportamento externo inalterado)
+Expected: `350 + 6 = 356 passed` (os testes que cobriam `run_command` continuam passando — comportamento externo inalterado)
 
 - [ ] **Step 5: Commit (pedir confirmação)**
 
@@ -4439,7 +4487,7 @@ Acrescentar ao `HELP_EPILOG_TEMPLATE`, na seção COMANDOS:
 - [ ] **Step 5: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `355 + 30 = 385 passed`
+Expected: `356 + 30 = 386 passed`
 
 - [ ] **Step 6: Smoke manual do protocolo (sem UI)**
 
@@ -5893,7 +5941,7 @@ def test_the_bridge_command_list_matches_the_ui_vocabulary():
 - [ ] **Step 2: Rodar**
 
 Run: `python -m pytest tests/ -q`
-Expected: `385 + 7 = 392 passed`
+Expected: `386 + 7 = 393 passed`
 
 - [ ] **Step 3: Smoke manual da janela**
 
