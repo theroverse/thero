@@ -1138,7 +1138,7 @@ consumidores reais são dois, cada um com seu par de variáveis: a Athena via
 `ATHENA_OLLAMA_HOST` / `ATHENA_OLLAMA_MODEL`
 (`athena/src/athena/settings.py:52-72`, default `http://localhost:11434`) e o
 Sentinel via `SENTINEL_OLLAMA_HOST` / `SENTINEL_OLLAMA_MODEL`
-(`sentinel/src/sentinel/settings.py:205-243`, default `http://127.0.0.1:11434`
+(`sentinel/src/sentinel/settings.py:255-279`, default `http://127.0.0.1:11434`
 e `qwen3-coder-next`). Os dois recusam host fora de loopback, e nenhum dos dois
 instala motor: o Thero só escreve onde apontar.
 
@@ -1147,7 +1147,6 @@ instala motor: o Thero só escreve onde apontar.
 `tests/test_localmodels.py`:
 
 ```python
-import io
 import json
 
 import pytest
@@ -1156,9 +1155,11 @@ from thero import localmodels
 
 
 class FakeResponse:
-    def __init__(self, payload, streaming=False):
+    """Corpo inteiro disponível via read() -- o mesmo contrato do
+    HTTPResponse real para o uso que o módulo faz (sem iterar a resposta)."""
+
+    def __init__(self, payload):
         self._payload = payload
-        self.streaming = streaming
 
     def read(self):
         return self._payload
@@ -1171,7 +1172,13 @@ class FakeResponse:
 
 
 class FakeUrlopen:
-    """Registra o que foi chamado e devolve o corpo pedido."""
+    """Registra o que foi chamado e devolve o corpo pedido.
+
+    Assina `__call__(request, timeout=None)` de propósito: o módulo SEMPRE
+    passa um `urllib.request.Request` (nunca uma string crua) e o timeout
+    como keyword -- é o contrato real de urlopen e a única forma do teste
+    provar que nenhum `ollama pull` pendurado trava o loop da ponte.
+    """
 
     def __init__(self, body=b'{"models": []}', error=None):
         self.calls = []
@@ -1225,11 +1232,21 @@ def test_a_refused_port_reports_down_instead_of_raising(monkeypatch):
     assert "recusado" in out["error"] or "refused" in out["error"]
 
 
-def test_only_loopback_is_ever_contacted():
+def test_only_loopback_is_ever_contacted(monkeypatch):
+    fake = FakeUrlopen()
+    monkeypatch.setattr(localmodels, "urlopen", fake)
     for bad in ("http://10.0.0.5:11434", "https://ollama.example.com",
                 "http://[fe80::1]:11434", "http://localhost.evil.com:11434"):
         with pytest.raises(ValueError):
             localmodels.list_models(bad)
+        with pytest.raises(ValueError):
+            localmodels.status(bad)
+        with pytest.raises(ValueError):
+            localmodels.delete("llama3.2", base=bad)
+        with pytest.raises(ValueError):
+            list(localmodels.pull("llama3.2", base=bad))
+    # o veto dispara antes de qualquer rede: nenhuma chamada chegou ao fake
+    assert fake.calls == []
 
 
 def test_loopback_spellings_are_all_accepted():
@@ -1253,6 +1270,9 @@ def test_pull_streams_lines_then_exits(monkeypatch):
     call = fake.calls[0]
     assert call["url"].endswith("/api/pull")
     assert json.loads(call["data"]) == {"name": "llama3.2", "stream": True}
+    # timeout SEMPRE como keyword e nunca None: pull pendurado nao congela
+    # o loop stdio da ponte
+    assert call["timeout"] == localmodels.OLLAMA_PROBE_TIMEOUT
 
 
 def test_pull_failure_becomes_exit_1_not_an_exception(monkeypatch):
@@ -1285,7 +1305,10 @@ def test_delete_refuses_a_foreign_host():
 - [ ] **Step 2: Rodar para confirmar falha**
 
 Run: `python -m pytest tests/test_localmodels.py -q`
-Expected: FAIL — `ModuleNotFoundError: No module named 'thero.localmodels'`
+Expected: FAIL — `ImportError: cannot import name 'localmodels' from 'thero'`
+(o pacote `thero` ja existe por causa das Tasks 1-2, entao o erro e de import
+de nome dentro do pacote, nao `ModuleNotFoundError` -- mesma raiz: o modulo
+ainda nao existe)
 
 - [ ] **Step 3: Implementação**
 
@@ -1294,13 +1317,18 @@ Create `src/thero/localmodels.py`:
 ```python
 """Modelos locais (Ollama): listar, puxar e apagar pelo HTTP do próprio Ollama.
 
-Contrato verificado na máquina: a Athena lê `ATHENA_OLLAMA_HOST` /
-`ATHENA_OLLAMA_MODEL` (athena/src/athena/settings.py) e o padrão é
-http://localhost:11434. Sentinel não tem código de Ollama -- por isso nada
-aqui inventa variável para o Sentinel.
+Contrato verificado na máquina: os consumidores são dois, cada um com seu par
+de variáveis -- a Athena lê `ATHENA_OLLAMA_HOST` / `ATHENA_OLLAMA_MODEL`
+(athena/src/athena/settings.py:52-72, default http://localhost:11434) e o
+Sentinel lê `SENTINEL_OLLAMA_HOST` / `SENTINEL_OLLAMA_MODEL`
+(sentinel/src/sentinel/settings.py:255-279, default http://127.0.0.1:11434 +
+qwen3-coder-next, com veto de host fora de loopback). Os dois só consomem:
+nada aqui instala motor -- o Thero escreve onde apontar.
 
-Regra de segurança: só loopback. Nenhuma função daqui aceita host remoto e
-nenhuma envioa credencial (os endpoints locais do Ollama não usam chave).
+Regra de segurança: só loopback, sem exceção. Nenhuma função daqui aceita
+host remoto e nenhuma envia credencial (os endpoints locais do Ollama não
+usam chave -- não inventar header de auth). Proibido print(): este módulo
+vive no processo da ponte, cujo stdout é o canal JSON.
 """
 
 from __future__ import annotations
@@ -1331,6 +1359,8 @@ def normalize_base(host: Optional[str] = "") -> str:
 
 
 def _assert_loopback(base: str) -> str:
+    # Comparacao EXATA de hostname: startswith/substring e o bypass classico
+    # de http://localhost.evil.com:11434 .
     host = (urlparse(base).hostname or "").lower()
     if host not in _LOOPBACK:
         raise ValueError(
@@ -1338,6 +1368,13 @@ def _assert_loopback(base: str) -> str:
             "(recebi %r)" % (host or base)
         )
     return base
+
+
+def _guard(base: str) -> str:
+    """normalize_base -> _assert_loopback, na mesma ordem, nos quatro
+    caminhos que fazem rede (list_models, pull, delete, status). O veto
+    dispara antes de qualquer chamada de rede."""
+    return _assert_loopback(normalize_base(base))
 
 
 def _describe(error: Exception) -> str:
@@ -1354,9 +1391,13 @@ def _describe(error: Exception) -> str:
 
 
 def list_models(base: str = "") -> dict:
-    url = _assert_loopback(normalize_base(base)) + "/api/tags"
+    url = _guard(base) + "/api/tags"
+    # Request com method explicito: o contrato de rede e sempre um objeto
+    # Request (nunca string crua) -- urlopen(string) nao expoe full_url/
+    # get_method/data e quebraria o fake e a uniformidade dos caminhos.
+    request = urllib.request.Request(url, method="GET")
     try:
-        with urlopen(url, timeout=OLLAMA_PROBE_TIMEOUT) as response:
+        with urlopen(request, timeout=OLLAMA_PROBE_TIMEOUT) as response:
             payload = json.loads(response.read().decode("utf-8", "replace"))
     except (urllib.error.URLError, ValueError, OSError) as exc:
         return {"ok": False, "models": [], "error": _describe(exc)}
@@ -1385,38 +1426,43 @@ def pull(name: str, base: str = "") -> Iterator[tuple]:
     O formato e o mesmo de system.process.stream_command, para a ponte tratar
     `ollama pull` e `npx skills` no mesmo painel de terminal.
     """
+    url = _guard(base) + "/api/pull"
     if not name:
         yield ("out", "informe o nome do modelo")
         yield ("exit", 2)
         return
-    url = _assert_loopback(normalize_base(base)) + "/api/pull"
     body = json.dumps({"name": name, "stream": True}).encode("utf-8")
     request = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with urlopen(request, timeout=None) as response:
-            for raw in response:
-                line = raw.decode("utf-8", "replace").strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    yield ("out", line)
-                    continue
-                text = event.get("status") or event.get("error") or line
-                yield ("out", text)
+        # timeout SEMPRE como keyword e nunca None (bug corrigido: sem teto,
+        # um `ollama pull` pendurado congela o loop stdio da ponte). O corpo
+        # e lido inteiro com read() e cortado em linhas -- a resposta NAO e
+        # iteravel neste caminho (iterar HTTPResponse/fake daria TypeError).
+        with urlopen(request, timeout=OLLAMA_PROBE_TIMEOUT) as response:
+            payload = response.read()
     except (urllib.error.URLError, OSError) as exc:
         yield ("out", _describe(exc))
         yield ("exit", 1)
         return
+    for raw in payload.split(b"\n"):
+        line = raw.decode("utf-8", "replace").strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            yield ("out", line)
+            continue
+        text = event.get("status") or event.get("error") or line
+        yield ("out", text)
     yield ("exit", 0)
 
 
 def delete(name: str, base: str = "") -> dict:
-    url = _assert_loopback(normalize_base(base)) + "/api/delete"
+    url = _guard(base) + "/api/delete"
     body = json.dumps({"name": name}).encode("utf-8")
     request = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"},
@@ -1431,11 +1477,16 @@ def delete(name: str, base: str = "") -> dict:
 
 
 def status(base: str = "") -> dict:
-    """Retrato enxuto para a tela: pronto/ausente + quantos modelos."""
-    out = list_models(base)
+    """Retrato enxuto para a tela: pronto/ausente + quantos modelos.
+
+    Contrato com envreport._ollama_probe (envreport.py:62-68): as chaves
+    `up`, `base`, `models`, `error` -- exatamente as que ele le.
+    """
+    url_base = _guard(base)
+    out = list_models(url_base)
     return {
         "up": bool(out["ok"]),
-        "base": normalize_base(base),
+        "base": url_base,
         "models": out["models"],
         "error": out["error"],
     }
@@ -1525,21 +1576,35 @@ def test_remove_allows_the_users_own_entries():
     assert "meu" not in [p["id"] for p in out["providers"]]
 
 
-def test_remove_refuses_the_provider_a_routing_role_still_points_at():
+def test_remove_refuses_a_provider_a_routing_slot_still_models_on():
+    # `models-set` grava routing[slot] = NOME DO MODELO, e a Task 5 escreve esse
+    # nome em ATHENA_OLLAMA_MODEL / SENTINEL_OLLAMA_MODEL. Apagar o provedor que
+    # fornece aquele modelo deixaria a variavel de ambiente com valor pendurado.
     cfg = json.loads(json.dumps(CFG))
     cfg["providers"].append({"id": "meu", "label": "Meu", "origin": "user",
-                             "roles": {"athena": True}, "model": "x"})
+                             "roles": {}, "model": "gpt-3.5-turbo",
+                             "models": ["gpt-3.5-turbo"]})
+    cfg["routing"]["athena"] = "gpt-3.5-turbo"
     with pytest.raises(providers.ProviderInUse):
         providers.remove(cfg, "meu")
+    # o slot sentinela ainda esta no llama3.2, que e do provedor ollama:
+    with pytest.raises(providers.ProviderInUse):
+        providers.remove(cfg, "ollama")
+    # o provedo ollama ainda e dono do llama3.2 roteado; o "meu" ainda e dono
+    # do gpt-3.5-turbo roteado. Os dois continuam protegidos:
+    cfg["routing"]["sentinel"] = "outro-modelo"
+    with pytest.raises(providers.ProviderInUse):
+        providers.remove(cfg, "meu")
+    with pytest.raises(providers.ProviderInUse):
+        providers.remove(cfg, "ollama")
 
 
 def test_register_session_kind_confirms_without_touching_the_network():
-    calls = []
-    p = dict(CFG["providers"][0], preset="claude", authKind="session",
-             authVar="", base="")
-    out = providers.register(p, runner=lambda *a: calls.append(a))
+    # o tipo `session` e a sessao do proprio produto: o Thero nao roda nada.
+    out = providers.register(dict(
+        CFG["providers"][0], preset="claude", authKind="session",
+        authVar="", base=""))
     assert out["ok"] is True
-    assert calls == []
     assert "sessao" in out["msg"].lower()
 
 
@@ -1561,13 +1626,18 @@ def test_register_apikey_with_the_variable_present(monkeypatch):
 
 def test_register_local_pings_only_loopback(monkeypatch):
     seen = []
-    monkeypatch.setattr(
-        providers.localmodels, "urlopen",
-        lambda url, timeout=None: seen.append(url) or FakeResponse(),
-    )
+
+    def fake(request, timeout=None):
+        # list_models() passa um Request (nunca uma string) -- mesma folha do
+        # FakeUrlopen da Task 3, so que aqui o que importa e a URL visitada.
+        seen.append(getattr(request, "full_url", str(request)))
+        return FakeResponse()
+
+    monkeypatch.setattr(providers.localmodels, "urlopen", fake)
     out = providers.register(CFG["providers"][1])
     assert out["ok"] is True
     assert seen and seen[0].startswith("http://127.0.0.1:11434")
+    assert seen[0].endswith("/api/tags")
 
 
 def test_register_local_refuses_a_remote_endpoint(monkeypatch):
